@@ -18,13 +18,17 @@
       ]
     },
     "noEmit": true,
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    "allowImportingTsExtensions": true
   },
   "include": [
     "server.ts",
     "app.tsx",
     "components",
     "lib",
-    "hooks"
+    "hooks",
+    "ui",
+    "test",
+    "spike"
   ]
 }

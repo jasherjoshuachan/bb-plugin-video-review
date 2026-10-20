@@ -161,7 +161,7 @@ const play = await page.evaluate(async (t: number) => {
   });
   return seen;
 }, seekTimeForFrame(index, startFrame));
-const offPts = play.filter(([mt]) => Math.abs(index.pts[frameAtTime(index, mt)] - mt) > 0.0005).length;
+const offPts = (play as Array<[number, number]>).filter(([mt]) => Math.abs(index.pts[frameAtTime(index, mt)] - mt) > 0.0005).length;
 
 await browser.close();
 close();
