@@ -17,6 +17,27 @@ import type { Note, Shape } from "../lib/types";
 
 export type Tool = "none" | "box" | "arrow";
 
+export type CompareMode = "ab" | "side" | "wipe" | "diff";
+
+/** A second version shown with the first, kept on the matching frame. */
+export interface CompareView {
+  url: string;
+  index: FrameIndexDto;
+  label: string;
+  mainLabel: string;
+  mode: CompareMode;
+  /** A/B mode: show the other version instead of this one. */
+  showOther: boolean;
+  /** Wipe position, 0-1 across the picture (the other version is right of it). */
+  wipe: number;
+  /** Difference mode: strength of the other layer, 0-1. */
+  opacity: number;
+  /** The other version's frame that matches the shown frame. */
+  target: number;
+  onWipe: (value: number) => void;
+  onMediaError: () => void;
+}
+
 export interface PlayerHandle {
   seek(frame: number): void;
   step(delta: number): void;
@@ -46,6 +67,82 @@ interface Props {
   onMediaError: () => void;
   onSelectNote: (note: Note) => void;
   onPlayingChange: (playing: boolean) => void;
+  /** Notes from other versions, marked at the frame they map to here (dimmed). */
+  mappedMarks?: { note: Note; frame: number }[];
+  compare?: CompareView | null;
+}
+
+/** The other version, kept on the frame that matches the main player. */
+function CompareVideo({
+  view,
+  box,
+  playing,
+  rate,
+  className,
+}: {
+  view: CompareView;
+  box: { left: number; top: number; width: number; height: number };
+  playing: boolean;
+  rate: number;
+  className: string;
+}) {
+  const ref = useRef<HTMLVideoElement | null>(null);
+  const shown = useRef(-1);
+  const { index, target } = view;
+
+  // Track which frame the other video shows.
+  useEffect(() => {
+    const video = ref.current;
+    if (!video || typeof video.requestVideoFrameCallback !== "function") return;
+    let handle = 0;
+    const onPresented = (_now: number, metadata: VideoFrameCallbackMetadata) => {
+      shown.current = frameAtTime(index, metadata.mediaTime);
+      handle = video.requestVideoFrameCallback(onPresented);
+    };
+    handle = video.requestVideoFrameCallback(onPresented);
+    return () => video.cancelVideoFrameCallback(handle);
+  }, [index, view.url]);
+
+  // Paused: sit exactly on the matching frame. Playing: follow, and resync when it drifts.
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) return;
+    if (!playing) {
+      video.pause();
+      if (shown.current !== target) video.currentTime = seekTimeForFrame(index, target);
+      return;
+    }
+    video.playbackRate = rate;
+    if (video.paused) {
+      video.currentTime = seekTimeForFrame(index, target);
+      void video.play().catch(() => undefined);
+    } else if (Math.abs(shown.current - target) > 2) {
+      video.currentTime = seekTimeForFrame(index, target);
+    }
+  }, [target, playing, rate, index]);
+
+  const style: React.CSSProperties = {};
+  if (view.mode === "ab") style.visibility = view.showOther ? "visible" : "hidden";
+  if (view.mode === "wipe") style.clipPath = `inset(0 0 0 ${box.left + view.wipe * box.width}px)`;
+  if (view.mode === "diff") {
+    style.mixBlendMode = "difference";
+    style.opacity = view.opacity;
+  }
+  return (
+    <video
+      ref={ref}
+      src={view.url}
+      preload="auto"
+      muted
+      playsInline
+      className={className}
+      style={style}
+      onLoadedMetadata={(event) => {
+        event.currentTarget.currentTime = seekTimeForFrame(index, target);
+      }}
+      onError={view.onMediaError}
+    />
+  );
 }
 
 function useContentBox(video: HTMLVideoElement | null, width: number, height: number) {
@@ -99,6 +196,10 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
   const box = useContentBox(videoEl, index.width, index.height);
   const [drag, setDrag] = useState<{ x: number; y: number; x2: number; y2: number } | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [rateNow, setRateNow] = useState(1);
+  const compare = props.compare ?? null;
+  const side = compare?.mode === "side";
   const loopRef = useRef({ loop, inPoint, outPoint });
   loopRef.current = { loop, inPoint, outPoint };
   const last = index.pts.length - 1;
@@ -209,6 +310,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 flex-1">
       <div className="relative min-h-0 flex-1 bg-black">
         <video
           ref={(element) => {
@@ -223,10 +325,60 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
             const target = resumeFrame.current;
             if (target !== null && target > 0) event.currentTarget.currentTime = seekTimeForFrame(index, target);
           }}
-          onPlay={() => props.onPlayingChange(true)}
-          onPause={() => props.onPlayingChange(false)}
+          onPlay={() => {
+            setIsPlaying(true);
+            props.onPlayingChange(true);
+          }}
+          onPause={() => {
+            setIsPlaying(false);
+            props.onPlayingChange(false);
+          }}
+          onRateChange={(event) => setRateNow(event.currentTarget.playbackRate)}
           onError={props.onMediaError}
         />
+        {compare && !side ? (
+          <CompareVideo
+            view={compare}
+            box={box}
+            playing={isPlaying}
+            rate={rateNow}
+            className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+          />
+        ) : null}
+        {compare ? (
+          <div className="pointer-events-none absolute left-2 top-2 flex gap-1 text-[11px]">
+            <span className={`rounded px-1.5 py-0.5 ${compare.mode === "ab" && compare.showOther ? "bg-black/50 text-white/60" : "bg-black/70 text-white"}`}>
+              A {compare.mainLabel}
+            </span>
+            {compare.mode !== "side" ? (
+              <span className={`rounded px-1.5 py-0.5 ${compare.mode !== "ab" || compare.showOther ? "bg-primary text-primary-foreground" : "bg-black/50 text-white/60"}`}>
+                B {compare.label} · frame {compare.target}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {compare?.mode === "wipe" ? (
+          <div
+            className="absolute z-10 w-3 -translate-x-1/2 cursor-ew-resize"
+            style={{ left: box.left + compare.wipe * box.width, top: box.top, height: box.height }}
+            role="slider"
+            aria-label="Wipe position"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(compare.wipe * 100)}
+            onPointerDown={(event) => {
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            onPointerMove={(event) => {
+              if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+              const parent = event.currentTarget.parentElement?.getBoundingClientRect();
+              if (!parent || box.width <= 0) return;
+              compare.onWipe(Math.max(0, Math.min(1, (event.clientX - parent.left - box.left) / box.width)));
+            }}
+          >
+            <div className="mx-auto h-full w-0.5 bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.5)]" />
+          </div>
+        ) : null}
         <svg
           viewBox={`0 0 ${index.width} ${index.height}`}
           preserveAspectRatio="none"
@@ -262,6 +414,21 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
           <ShapeMarks shapes={[...props.shapes, ...pending]} />
         </svg>
       </div>
+      {compare && side ? (
+        <div className="relative min-h-0 flex-1 border-l border-border bg-black">
+          <CompareVideo
+            view={compare}
+            box={box}
+            playing={isPlaying}
+            rate={rateNow}
+            className="absolute inset-0 h-full w-full object-contain"
+          />
+          <span className="pointer-events-none absolute left-2 top-2 rounded bg-primary px-1.5 py-0.5 text-[11px] text-primary-foreground">
+            B {compare.label} · frame {compare.target}
+          </span>
+        </div>
+      ) : null}
+      </div>
       <div
         className="relative h-6 shrink-0 cursor-pointer border-t border-border bg-muted/40"
         role="slider"
@@ -296,6 +463,20 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
               onClick={() => props.onSelectNote(note)}
             />
           ))}
+        {(props.mappedMarks ?? []).map(({ note, frame: at }) => (
+          <button
+            key={`m-${note.id}`}
+            type="button"
+            title={`#${note.seq} from ${note.versionLabel}: ${note.text}`}
+            aria-label={`Note ${note.seq} from ${note.versionLabel}`}
+            className={`absolute top-1 h-3 w-1.5 -translate-x-1/2 rounded-sm border border-dashed ${
+              note.id === props.activeId ? "border-primary bg-primary/40" : "border-foreground/60 bg-transparent hover:bg-foreground/40"
+            }`}
+            style={{ left: pct(at) }}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => props.onSelectNote(note)}
+          />
+        ))}
         <div className="pointer-events-none absolute inset-y-0 w-0.5 bg-red-500" style={{ left: pct(frame) }} />
       </div>
     </div>

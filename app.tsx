@@ -9,7 +9,8 @@ export default definePluginApp((app) => {
   app.slots.fileOpener({
     id: "video-review",
     title: "Video Review (frame notes)",
-    extensions: ["mp4", "m4v", "mov", "webm"],
+    // .vreview: an open request written by `bb video-review open` (which video, frame, compare).
+    extensions: ["mp4", "m4v", "mov", "webm", "vreview"],
     component: VideoReviewOpener,
   });
 });

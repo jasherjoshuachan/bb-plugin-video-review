@@ -8,10 +8,22 @@ import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { frameLabel, timecode } from "../lib/frame-math";
-import type { Note, NoteKind, Shape } from "../lib/types";
-import { errorText, useDiskSha, useNotes, useReviewRpc, useVideo, type Loaded } from "./hooks";
+import type { FrameIndexDto, MediaDto, ReportDto } from "../lib/contract";
+import type { Note, NoteKind, Shape, VideoVersion } from "../lib/types";
+import { CompareBar, ReportPanel, viewable, type CompareState } from "./compare";
+import {
+  errorText,
+  useDiskSha,
+  useFrameMaps,
+  useMappings,
+  useNotes,
+  useOpenIntent,
+  useReviewRpc,
+  useVideo,
+  type Loaded,
+} from "./hooks";
 import { NoteEditor, NotesList, type EditorValue, type NoteActions } from "./notes-panel";
-import { Player, type PlayerHandle, type Tool } from "./player";
+import { Player, type CompareView, type PlayerHandle, type Tool } from "./player";
 
 /** Below this tab width the notes go under the player. */
 const WIDE_MIN_PX = 760;
@@ -30,6 +42,9 @@ const KEYS: [string, string][] = [
   ["B / A", "Draw a box / an arrow"],
   [", / .", "Previous / next note"],
   ["F", "Go to frame number"],
+  ["C", "Compare with the previous version"],
+  ["\\", "A/B: flip between the two"],
+  ["V / R / N", "Verify mode: verify, reopen, next"],
   ["Esc", "Stop drawing, close"],
   ["?", "This help"],
 ];
@@ -48,7 +63,7 @@ interface Pending {
 }
 
 export function VideoReviewOpener({ path, source }: PluginFileOpenerProps) {
-  const { loaded, error, reload, refreshMedia } = useVideo(path, source);
+  const { loaded, error, reload, refreshMedia, loadVersion } = useVideo(path, source);
   if (error) {
     return (
       <Centered>
@@ -65,18 +80,30 @@ export function VideoReviewOpener({ path, source }: PluginFileOpenerProps) {
       </Centered>
     );
   }
-  return <Review loaded={loaded} reload={reload} refreshMedia={refreshMedia} source={source} />;
+  return <Review loaded={loaded} reload={reload} refreshMedia={refreshMedia} loadVersion={loadVersion} source={source} />;
+}
+
+/** Older first, by when each version was first seen. */
+function byAge(versions: VideoVersion[]): VideoVersion[] {
+  return [...versions].sort((a, b) => a.firstSeenAt - b.firstSeenAt);
+}
+
+function findVersionRef(versions: VideoVersion[], ref: string): VideoVersion | null {
+  const wanted = ref.trim().toLowerCase();
+  return versions.find((v) => v.label === wanted) ?? (wanted.length >= 8 ? versions.find((v) => v.sha256.startsWith(wanted)) ?? null : null);
 }
 
 function Review({
   loaded,
   reload,
   refreshMedia,
+  loadVersion,
   source,
 }: {
   loaded: Loaded;
   reload: () => Promise<void>;
   refreshMedia: () => Promise<void>;
+  loadVersion: (sha256: string) => Promise<void>;
   source: PluginFileOpenerProps["source"];
 }) {
   const { video, version, index, media } = loaded;
@@ -90,7 +117,7 @@ function Review({
   const player = useRef<PlayerHandle | null>(null);
   const root = useRef<HTMLDivElement | null>(null);
 
-  const [frame, setFrame] = useState(0);
+  const [frame, setFrame] = useState(loaded.intent?.frame ?? 0);
   const [playing, setPlaying] = useState(false);
   const [inPoint, setIn] = useState<number | null>(null);
   const [outPoint, setOut] = useState<number | null>(null);
@@ -104,6 +131,23 @@ function Review({
   const [help, setHelp] = useState(false);
   const [goTo, setGoTo] = useState<string | null>(null);
   const [wide, setWide] = useState(true);
+  const [compare, setCompare] = useState<CompareState | null>(null);
+  const [other, setOther] = useState<{ version: VideoVersion; index: FrameIndexDto; media: MediaDto } | null>(null);
+  const [report, setReport] = useState<{ open: boolean; data: ReportDto | null; error: string | null }>({ open: false, data: null, error: null });
+  const [verifying, setVerifying] = useState(false);
+  const pendingIntent = useRef<string | null>(loaded.intent?.compare ?? null);
+
+  const versions = useMemo(() => byAge(disk?.versions ?? [version]), [disk?.versions, version]);
+  const diskSha = disk?.sha256 ?? null;
+  const onDiskFile = diskSha === null || diskSha === index.sha256;
+  const notesKey = notes.map((n) => `${n.id}:${n.status}:${n.updatedAt}`).join(",");
+  const mappings = useMappings(video.id, index.sha256, notesKey);
+  const { maps, error: mapError } = useFrameMaps(video.id, compare ? index.sha256 : null, compare?.sha ?? null);
+  const target = compare && maps ? maps.forward[Math.min(frame, maps.forward.length - 1)] ?? null : null;
+  const fixedQueue = useMemo(
+    () => notes.filter((note) => note.status === "fixed" && note.frameIn !== null).sort((a, b) => a.seq - b.seq),
+    [notes],
+  );
 
   const last = index.pts.length - 1;
   const drafts = notes.filter((note) => note.status === "draft");
@@ -127,6 +171,11 @@ function Review({
 
   const openEditor = useCallback(() => {
     player.current?.pause();
+    if (!onDiskFile) {
+      const now = versions.find((v) => v.sha256 === diskSha);
+      toast.message(`Notes go on the file on disk now${now ? ` (${now.label})` : ""}. Switch to it to add notes.`);
+      return;
+    }
     const hasRange = inPoint !== null && outPoint !== null && outPoint > inPoint;
     const inRange = hasRange && frame >= inPoint! && frame <= outPoint!;
     // The frame is bound now, when the note starts, not when it is saved.
@@ -137,25 +186,179 @@ function Review({
       kinds: inRange ? ["range", "frame", "general"] : ["frame", "general"],
       initial: { kind: inRange ? "range" : "frame", text: "", category: "other" },
     });
-  }, [frame, inPoint, outPoint]);
+  }, [frame, inPoint, outPoint, onDiskFile, versions, diskSha]);
+
+  /** Where a note sits on the version being viewed: its own frame, or where it maps to. */
+  const frameHere = useCallback(
+    (note: Note): number | null => {
+      if (note.frameIn === null) return null;
+      if (note.mediaSha256 === index.sha256) return note.frameIn;
+      const mapping = mappings.get(note.id);
+      return mapping && !mapping.unmappable ? mapping.frameIn : null;
+    },
+    [index.sha256, mappings],
+  );
 
   const selectNote = useCallback(
     (note: Note) => {
       setActiveId(note.id);
-      if (note.frameIn !== null && note.mediaSha256 === index.sha256) player.current?.seek(note.frameIn);
-      else if (note.frameIn !== null) toast.message(`This note was written on ${note.versionLabel}; its frame may not match this file.`);
+      if (note.frameIn === null) return;
+      const here = frameHere(note);
+      if (here === null) {
+        toast.message(`This note was written on ${note.versionLabel} and has no reliable match on ${version.label}.`);
+        return;
+      }
+      player.current?.seek(here);
+      const mapping = note.mediaSha256 === index.sha256 ? null : mappings.get(note.id);
+      if (mapping && mapping.confidence !== "high") {
+        toast.message(`From ${note.versionLabel}: mapped to frame ${here} by ${mapping.method}, ${mapping.confidence} confidence.`);
+      }
     },
-    [index.sha256],
+    [frameHere, index.sha256, mappings, version.label],
   );
 
   const jumpNote = useCallback(
     (direction: 1 | -1) => {
-      const framed = notes.filter((note) => note.frameIn !== null).sort((a, b) => a.frameIn! - b.frameIn!);
-      const next = direction > 0 ? framed.find((note) => note.frameIn! > frame) : [...framed].reverse().find((note) => note.frameIn! < frame);
-      if (next) selectNote(next);
+      const framed = notes
+        .map((note) => ({ note, at: frameHere(note) }))
+        .filter((item): item is { note: Note; at: number } => item.at !== null)
+        .sort((a, b) => a.at - b.at);
+      const next = direction > 0 ? framed.find((item) => item.at > frame) : [...framed].reverse().find((item) => item.at < frame);
+      if (next) selectNote(next.note);
     },
-    [notes, frame, selectNote],
+    [notes, frame, selectNote, frameHere],
   );
+
+  /** Show another version in this tab, staying on the matching moment. */
+  const switchVersion = useCallback(
+    async (sha256: string) => {
+      if (sha256 === index.sha256) return;
+      player.current?.pause();
+      try {
+        const m = await rpc.call("versions.maps", { videoId: video.id, fromSha: index.sha256, toSha: sha256 }).catch(() => null);
+        setFrame(m ? m.forward[Math.min(frame, m.forward.length - 1)] ?? frame : frame);
+        setCompare((current) => (current && current.sha === sha256 ? { ...current, sha: index.sha256 } : current));
+        await loadVersion(sha256);
+      } catch (cause) {
+        toast.error(errorText(cause));
+      }
+    },
+    [rpc, video.id, index.sha256, frame, loadVersion],
+  );
+
+  const previousVersion = useCallback((): VideoVersion | null => {
+    const at = versions.findIndex((v) => v.sha256 === index.sha256);
+    const candidates = [...versions.slice(0, Math.max(0, at)).reverse(), ...versions.slice(at + 1)];
+    return candidates.find((v) => viewable(v, diskSha)) ?? null;
+  }, [versions, index.sha256, diskSha]);
+
+  const startCompare = useCallback(
+    (sha256?: string) => {
+      const otherVersion = sha256 ? versions.find((v) => v.sha256 === sha256) ?? null : previousVersion();
+      if (!otherVersion) {
+        toast.message("There is no other version of this video to compare with yet.");
+        return;
+      }
+      if (!viewable(otherVersion, diskSha)) {
+        toast.message(`${otherVersion.label} is no longer kept, so it cannot be shown.`);
+        return;
+      }
+      setCompare((current) => ({ sha: otherVersion.sha256, mode: current?.mode ?? "ab", showOther: false, wipe: current?.wipe ?? 0.5, opacity: current?.opacity ?? 1 }));
+    },
+    [versions, previousVersion, diskSha],
+  );
+
+  // The other version's frame index and media, for the compare view.
+  useEffect(() => {
+    if (!compare) {
+      setOther(null);
+      return;
+    }
+    if (other?.version.sha256 === compare.sha) return;
+    let alive = true;
+    rpc.call("versions.load", { videoId: video.id, sha256: compare.sha }).then(
+      (result) => alive && setOther(result),
+      (cause: unknown) => {
+        if (!alive) return;
+        toast.error(`Could not load the other version: ${errorText(cause)}`);
+        setCompare(null);
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, [rpc, video.id, compare, other?.version.sha256]);
+
+  // Opened through `bb video-review open … --compare vN`: start comparing once the versions are known.
+  useEffect(() => {
+    const ref = pendingIntent.current;
+    if (!ref || !disk) return;
+    pendingIntent.current = null;
+    const found = findVersionRef(versions, ref);
+    if (found && found.sha256 !== index.sha256) startCompare(found.sha256);
+    else if (!found) toast.message(`No version ${ref} of this video.`);
+  }, [disk, versions, index.sha256, startCompare]);
+
+  useOpenIntent(video.id, (intent) => {
+    if (intent.frame !== null) player.current?.seek(intent.frame);
+    if (intent.compare) {
+      const found = findVersionRef(versions, intent.compare);
+      if (found && found.sha256 !== index.sha256) startCompare(found.sha256);
+    }
+  });
+
+  /** Check a fix: view the render it was fixed in at the matching frame, A/B against the version it was written on. */
+  const checkNote = useCallback(
+    async (note: Note) => {
+      if (note.frameIn === null) return;
+      const fixedIn = note.fixedInSha ?? diskSha ?? index.sha256;
+      try {
+        const { mappings: list } = await rpc.call("notes.mapped", { videoId: video.id, toSha: fixedIn });
+        const mapping = list.find((m) => m.noteId === note.id);
+        const at = note.mediaSha256 === fixedIn ? note.frameIn : mapping && !mapping.unmappable ? mapping.frameIn : null;
+        setActiveId(note.id);
+        if (fixedIn !== index.sha256) {
+          player.current?.pause();
+          if (at !== null) setFrame(at);
+          await loadVersion(fixedIn);
+        } else if (at !== null) {
+          player.current?.seek(at);
+        }
+        if (note.mediaSha256 !== fixedIn) {
+          setCompare((current) => ({ sha: note.mediaSha256, mode: current?.mode ?? "ab", showOther: false, wipe: current?.wipe ?? 0.5, opacity: current?.opacity ?? 1 }));
+        }
+        if (at === null) toast.message(`Frame ${note.frameIn} of ${note.versionLabel} has no reliable match in the fixed render.`);
+      } catch (cause) {
+        toast.error(errorText(cause));
+      }
+    },
+    [rpc, video.id, diskSha, index.sha256, loadVersion],
+  );
+
+  const verifyNote = fixedQueue[0] ?? null;
+  // Verify mode walks the fixed notes; each verify or reopen drops the note from the queue.
+  useEffect(() => {
+    if (!verifying) return;
+    if (!verifyNote) {
+      setVerifying(false);
+      toast.success("Every fix is checked.");
+      return;
+    }
+    void checkNote(verifyNote);
+    // Only when the note in front changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [verifying, verifyNote?.id]);
+
+  const openReport = useCallback(() => {
+    if (!compare) return;
+    const pair = byAge(versions.filter((v) => v.sha256 === compare.sha || v.sha256 === index.sha256));
+    if (pair.length !== 2) return;
+    setReport({ open: true, data: null, error: null });
+    rpc.call("versions.report", { videoId: video.id, fromSha: pair[0].sha256, toSha: pair[1].sha256 }).then(
+      (data) => setReport({ open: true, data, error: null }),
+      (cause: unknown) => setReport({ open: true, data: null, error: errorText(cause) }),
+    );
+  }, [rpc, video.id, compare, versions, index.sha256]);
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     const target = event.target as HTMLElement;
@@ -233,14 +436,32 @@ function Review({
     } else if (key === "?") {
       handled();
       setHelp((value) => !value);
+    } else if (key === "c" || key === "C") {
+      handled();
+      if (compare) setCompare(null);
+      else startCompare();
+    } else if (key === "\\") {
+      handled();
+      if (compare) setCompare({ ...compare, mode: "ab", showOther: compare.mode === "ab" ? !compare.showOther : true });
+    } else if (verifying && verifyNote && (key === "v" || key === "V")) {
+      handled();
+      actions.onVerify(verifyNote);
+    } else if (verifying && verifyNote && (key === "r" || key === "R")) {
+      handled();
+      actions.onReopen(verifyNote);
+    } else if (verifying && (key === "n" || key === "N")) {
+      handled();
+      toast.message("Verify or reopen this one to move on; Esc leaves verify mode.");
     } else if (key === "Escape") {
       handled();
       if (tool !== "none") setTool("none");
       else if (help) setHelp(false);
-      else {
+      else if (report.open) setReport({ open: false, data: null, error: null });
+      else if (verifying) setVerifying(false);
+      else if (pending) {
         setPending(null);
         setShapes([]);
-      }
+      } else if (compare) setCompare(null);
     }
   };
 
@@ -292,6 +513,7 @@ function Review({
     onReopen: (note) => run(rpc.call("notes.reopen", { id: note.id })),
     onVerify: (note) => run(rpc.call("notes.verify", { id: note.id })),
     onWontfix: (note) => run(rpc.call("notes.wontfix", { id: note.id })),
+    onCheck: (note) => void checkNote(note),
   };
 
   const send = async (target: "thread" | "new") => {
@@ -341,6 +563,28 @@ function Review({
     return pending.frameOut > pending.frameIn ? `${start} → ${timecode(index, pending.frameOut)} (${pending.frameOut})` : start;
   }, [pending, index, version.label]);
 
+  const compareView: CompareView | null =
+    compare && other && other.version.sha256 === compare.sha && target !== null
+      ? {
+          url: other.media.url,
+          index: other.index,
+          label: other.version.label,
+          mainLabel: version.label,
+          mode: compare.mode,
+          showOther: compare.showOther,
+          wipe: compare.wipe,
+          opacity: compare.opacity,
+          target: Math.max(0, Math.min(other.index.pts.length - 1, target)),
+          onWipe: (wipe) => setCompare((current) => (current ? { ...current, wipe } : current)),
+          onMediaError: () => {
+            void rpc
+              .call("versions.mediaUrl", { videoId: video.id, sha256: other.version.sha256, refresh: true })
+              .then((media) => setOther((current) => (current ? { ...current, media } : current)))
+              .catch(() => toast.error("The other version could not be loaded."));
+          },
+        }
+      : null;
+
   const fps = index.fps.num / index.fps.den;
   const notesPanel = (
     <div className={cn("min-h-0 overflow-auto bg-background", wide ? "w-80 shrink-0 border-l border-border" : "h-[45%] border-t border-border")}>
@@ -369,7 +613,18 @@ function Review({
         currentSha={index.sha256}
         stillBase={stillBase}
         actions={actions}
-        header={notesError ? <p className="text-xs text-destructive">{notesError}</p> : null}
+        mappings={mappings}
+        viewingLabel={version.label}
+        header={
+          <>
+            {notesError ? <p className="text-xs text-destructive">{notesError}</p> : null}
+            {fixedQueue.length > 0 && !verifying ? (
+              <Button size="sm" variant="secondary" className="h-7 w-full" onClick={() => setVerifying(true)}>
+                <Icon name="Check" className="size-4" /> Check {fixedQueue.length} fix{fixedQueue.length === 1 ? "" : "es"} one by one
+              </Button>
+            ) : null}
+          </>
+        }
       />
     </div>
   );
@@ -383,7 +638,23 @@ function Review({
       aria-label={`Video review: ${video.name}`}
     >
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2 text-xs">
-        <span className="rounded bg-muted px-1.5 py-0.5 font-medium">{version.label}</span>
+        {versions.length > 1 ? (
+          <select
+            aria-label="Version"
+            className="h-6 rounded border border-input bg-transparent px-1 font-medium"
+            value={index.sha256}
+            onChange={(event) => void switchVersion(event.target.value)}
+          >
+            {versions.map((v) => (
+              <option key={v.sha256} value={v.sha256} disabled={!viewable(v, diskSha)}>
+                {v.label}
+                {v.sha256 === diskSha ? " (on disk)" : viewable(v, diskSha) ? " (kept)" : " (not kept)"}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="rounded bg-muted px-1.5 py-0.5 font-medium">{version.label}</span>
+        )}
         <span className="font-mono text-muted-foreground" title={index.sha256}>
           {index.sha256.slice(0, 12)}
         </span>
@@ -392,6 +663,16 @@ function Review({
         </span>
         <div className="flex-1" />
         {needsYou > 0 ? <span className="text-primary">{needsYou} need you</span> : null}
+        <Button
+          size="sm"
+          variant={compare ? "secondary" : "ghost"}
+          className="h-7 px-2"
+          disabled={versions.length < 2}
+          aria-label={versions.length < 2 ? "Compare needs a second version of this video" : "Compare with another version (C)"}
+          onClick={() => (compare ? setCompare(null) : startCompare())}
+        >
+          Compare
+        </Button>
         <Button
           size="sm"
           variant="ghost"
@@ -409,10 +690,47 @@ function Review({
         </Button>
       </div>
 
+      {compare ? (
+        <CompareBar
+          videoId={video.id}
+          viewing={version}
+          versions={versions}
+          currentSha={diskSha}
+          state={compare}
+          frame={frame}
+          target={target}
+          mapError={mapError}
+          onChange={setCompare}
+          onClose={() => setCompare(null)}
+          onShowReport={openReport}
+        />
+      ) : null}
+
+      {verifying && verifyNote ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-primary/40 bg-primary/10 px-3 py-1.5 text-xs">
+          <span className="font-medium">
+            Checking fix #{verifyNote.seq} · {fixedQueue.length} left
+          </span>
+          <span className="min-w-0 flex-1 truncate" title={verifyNote.text}>
+            {verifyNote.text}
+            {verifyNote.statusNote ? <span className="text-muted-foreground"> · agent: {verifyNote.statusNote}</span> : null}
+          </span>
+          <Button size="sm" className="h-6 px-2 text-xs" onClick={() => actions.onVerify(verifyNote)}>
+            Verify (V)
+          </Button>
+          <Button size="sm" variant="secondary" className="h-6 px-2 text-xs" onClick={() => actions.onReopen(verifyNote)}>
+            Reopen (R)
+          </Button>
+          <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={() => setVerifying(false)}>
+            Stop
+          </Button>
+        </div>
+      ) : null}
+
       {changedOnDisk || (disk?.sha256 && disk.sha256 !== index.sha256) ? (
         <div className="flex shrink-0 items-center gap-2 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs">
           <span className="flex-1">
-            The file on disk changed{changedOnDisk ? ` (now ${changedOnDisk.label})` : ""}. You are looking at {version.label}; notes stay on the version they were written on.
+            {`You are looking at ${version.label}; the file on disk is ${changedOnDisk?.label ?? "a newer render"}. New notes go on the file on disk. Notes stay on the version they were written on and show where they land on the one you view.`}
           </span>
           <Button size="sm" variant="secondary" className="h-6 px-2 text-xs" onClick={() => void reload().catch((cause) => toast.error(errorText(cause)))}>
             Load {changedOnDisk?.label ?? "it"}
@@ -427,6 +745,11 @@ function Review({
             url={media.url}
             index={index}
             notes={notes.filter((note) => note.mediaSha256 === index.sha256)}
+            mappedMarks={notes
+              .filter((note) => note.mediaSha256 !== index.sha256 && note.status !== "verified" && note.status !== "wontfix")
+              .map((note) => ({ note, frame: frameHere(note) }))
+              .filter((item): item is { note: Note; frame: number } => item.frame !== null)}
+            compare={compareView}
             activeId={activeId}
             frame={frame}
             onFrame={onFrame}
@@ -511,6 +834,20 @@ function Review({
         </div>
         {notesPanel}
       </div>
+
+      {report.open ? (
+        <ReportPanel
+          report={report.data}
+          error={report.error}
+          fps={fps}
+          onClose={() => setReport({ open: false, data: null, error: null })}
+          onJump={({ oldFrame, newFrame }) => {
+            if (!report.data) return;
+            const at = index.sha256 === report.data.to.sha256 ? newFrame : index.sha256 === report.data.from.sha256 ? oldFrame : null;
+            if (at !== null) player.current?.seek(at);
+          }}
+        />
+      ) : null}
 
       {help ? (
         <div className="absolute right-3 top-12 z-10 w-72 rounded-md border border-border bg-popover p-3 text-xs shadow-lg">

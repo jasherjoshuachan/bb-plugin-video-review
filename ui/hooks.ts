@@ -9,7 +9,7 @@ import {
   useRpc,
   type PluginFileOpenerSource,
 } from "@get-bb/plugin-sdk/app";
-import type { FrameIndexDto, MediaDto, RpcContract } from "../lib/contract";
+import type { FrameIndexDto, MediaDto, NoteMappingDto, RpcContract } from "../lib/contract";
 import type { Note, ReviewVideo, VideoVersion } from "../lib/types";
 
 /** How often an open tab checks whether the file was re-rendered. */
@@ -30,6 +30,8 @@ export interface Loaded {
   version: VideoVersion;
   index: FrameIndexDto;
   media: MediaDto;
+  /** How the tab was asked to open (`bb video-review open`): a frame and a version to compare with. */
+  intent?: { frame: number | null; compare: string | null } | null;
 }
 
 export function useVideo(path: string, source: PluginFileOpenerSource) {
@@ -61,13 +63,23 @@ export function useVideo(path: string, source: PluginFileOpenerSource) {
     setLoaded((current) => (current ? { ...current, ...next } : current));
   }, [rpc, loaded]);
 
+  /** Show another version (the file on disk or a kept copy) in the same tab. */
+  const loadVersion = useCallback(
+    async (sha256: string) => {
+      if (!loaded) return;
+      const next = await rpc.call("versions.load", { videoId: loaded.video.id, sha256 });
+      setLoaded((current) => (current ? { ...current, ...next, intent: null } : current));
+    },
+    [rpc, loaded],
+  );
+
   const refreshMedia = useCallback(async () => {
     if (!loaded) return;
-    const media = await rpc.call("video.mediaUrl", { videoId: loaded.video.id, refresh: true });
+    const media = await rpc.call("versions.mediaUrl", { videoId: loaded.video.id, sha256: loaded.version.sha256, refresh: true });
     setLoaded((current) => (current ? { ...current, media } : current));
   }, [rpc, loaded]);
 
-  return { loaded, error, reload, refreshMedia };
+  return { loaded, error, reload, refreshMedia, loadVersion };
 }
 
 /** The sha256 of the file on disk now, polled while the tab is visible. */
@@ -135,4 +147,57 @@ export function useNotes(videoId: string | null) {
   }, [connection, refetch]);
 
   return { notes, stillBase, error, refetch, setNotes };
+}
+
+/** Where notes written on other versions land on the version being viewed. */
+export function useMappings(videoId: string | null, sha256: string | null, notesKey: string) {
+  const rpc = useReviewRpc();
+  const [mappings, setMappings] = useState<Map<string, NoteMappingDto>>(new Map());
+  useEffect(() => {
+    if (!videoId || !sha256) return;
+    let alive = true;
+    rpc.call("notes.mapped", { videoId, toSha: sha256 }).then(
+      (result) => alive && setMappings(new Map(result.mappings.map((m) => [m.noteId, m]))),
+      () => alive && setMappings(new Map()),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [rpc, videoId, sha256, notesKey]);
+  return mappings;
+}
+
+/** Frame maps between the viewed version and another: forward[frame] is the other's matching frame. */
+export function useFrameMaps(videoId: string | null, fromSha: string | null, toSha: string | null) {
+  const rpc = useReviewRpc();
+  const [maps, setMaps] = useState<{ key: string; forward: number[]; backward: number[] } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const key = `${fromSha}:${toSha}`;
+  useEffect(() => {
+    if (!videoId || !fromSha || !toSha) return;
+    let alive = true;
+    setError(null);
+    rpc.call("versions.maps", { videoId, fromSha, toSha }).then(
+      (result) => alive && setMaps({ key, ...result }),
+      (cause: unknown) => alive && setError(errorText(cause)),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [rpc, videoId, fromSha, toSha, key]);
+  return { maps: maps && maps.key === key ? maps : null, error };
+}
+
+/** `bb video-review open` on a video this tab already shows: jump and compare without reopening. */
+export function useOpenIntent(videoId: string | null, onIntent: (intent: { frame: number | null; compare: string | null }) => void) {
+  const handler = useRef(onIntent);
+  handler.current = onIntent;
+  useRealtime("video-review-intent", (payload: unknown) => {
+    const data = payload as { videoId?: unknown; frame?: unknown; compare?: unknown } | null;
+    if (!data || data.videoId !== videoId) return;
+    handler.current({
+      frame: typeof data.frame === "number" ? data.frame : null,
+      compare: typeof data.compare === "string" ? data.compare : null,
+    });
+  });
 }

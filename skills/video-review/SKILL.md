@@ -30,16 +30,30 @@ status live, so report each one as you finish it.
      raw frame, the marked-up frame, the crop).
 3. Fix the source the video is built from (the edit script, scene code,
    timing data), never the mp4 by hand, then re-render to the same path.
-4. Check each fix on the new file: `bb video-review frame <id> --current`
-   gives the same frame number from the file on disk now. Look at it. For
-   timing notes, also check the frames around it.
+4. Check each fix on the new file. A re-render can move moments, so do not
+   assume the same frame number: `bb video-review compare <id>` finds where
+   the note's moment lands on the file on disk now (by the render manifest
+   when both versions have one, else by matching pictures), prints that
+   frame, how far it moved, and a pixel difference with the box of what
+   changed, plus PNG paths. Look at the PNGs. For timing notes, also check
+   the frames around it. `bb video-review compare --file <video> --versions
+   v1,v2` lists every timing shift, changed picture and moved scene edge
+   between two renders: check that only what the notes asked for changed.
+   If the pipeline writes a render manifest (sections and scenes with
+   `t0`/`t1` in seconds), attach it after each render:
+   `bb video-review timeline <video> <manifest.json>` (a
+   `<video>.timeline.json` beside the video is picked up on its own).
 5. Close each fixed note with the new file's sha256 and a one-line note in the
    user's language:
    `bb video-review resolve <id> --sha <sha256 of the new render> --note "what changed"`.
    Several ids can share one note when one change covers them.
 6. When a note is ambiguous, conflicts with another, or cannot be done, do not
    guess: `bb video-review reply <id> --note "question or reason"`.
-7. Finish with a short summary: what changed, the new sha256, and which notes
+7. Open the review for the user on the new render, at the first fixed note,
+   comparing with the version the notes were written on:
+   `bb video-review open <video> --frame <mapped frame> --compare v1`
+   (the video must be in this thread's workspace or thread storage).
+8. Finish with a short summary: what changed, the new sha256, and which notes
    wait for the user.
 
 ## Commands
@@ -51,6 +65,10 @@ status live, so report each one as you finish it.
 | `bb video-review frame <id> [--current]` | Write the note's frame as PNGs and print the paths. |
 | `bb video-review resolve <id...> --sha <sha256> --note "…"` | Mark fixed in the re-rendered file. Refused unless `--sha` is the file on disk now and differs from the note's file. |
 | `bb video-review reply <id> --note "…"` | Answer without fixing. |
+| `bb video-review compare <id> [--to vN]` | Where the note's frame lands on vN (default: the file on disk now), how it was matched, and a pixel diff with PNGs. |
+| `bb video-review compare --file <video> --versions v1,v2 [--frame n]` | What changed between two renders: timing shifts, changed pictures, moved scene edges; with `--frame`, a pixel diff at that frame of the first version. |
+| `bb video-review timeline <video> <manifest.json>` | Attach the render manifest to the version on disk now. |
+| `bb video-review open <video> [--frame n] [--compare vN]` | Open the Video Review tab in this thread, optionally at a frame and comparing with a version. |
 
 Add `--json` when the output drives code.
 

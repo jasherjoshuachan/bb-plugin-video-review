@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import type { NoteMappingDto } from "../lib/contract";
 import { NOTE_CATEGORIES, isStale, noteLocation, shortSha, type Note, type NoteCategory, type NoteKind } from "../lib/types";
 
 export interface NoteActions {
@@ -13,6 +14,35 @@ export interface NoteActions {
   onReopen(note: Note): void;
   onVerify(note: Note): void;
   onWontfix(note: Note): void;
+  /** Open the fix: compare the note's version with the render it was fixed in, at the matching frame. */
+  onCheck?(note: Note): void;
+}
+
+function MappingBadge({ mapping, viewingLabel }: { mapping: NoteMappingDto; viewingLabel: string }) {
+  if (mapping.unmappable || mapping.frameIn === null) {
+    return (
+      <span className="rounded bg-destructive/15 px-1.5 py-px text-destructive" title="No reliable match for this moment in the version you are viewing">
+        no match on {viewingLabel}
+      </span>
+    );
+  }
+  const moved = mapping.shifted === 0 ? "same frame" : `${mapping.shifted > 0 ? "+" : ""}${mapping.shifted} frames`;
+  const both =
+    mapping.manifest && mapping.content && mapping.manifest.frame !== mapping.content.frame
+      ? ` (manifest ${mapping.manifest.frame}, picture ${mapping.content.frame})`
+      : "";
+  return (
+    <span
+      className={cn(
+        "rounded px-1.5 py-px",
+        mapping.confidence === "high" ? "bg-sky-500/15 text-sky-700 dark:text-sky-300" : "bg-amber-500/20 text-amber-700 dark:text-amber-300",
+      )}
+      title={`Mapped by ${mapping.method}, ${mapping.confidence} confidence${both}`}
+    >
+      → {viewingLabel} frame {mapping.frameIn} · {moved} · {mapping.method}
+      {mapping.confidence !== "high" ? `, ${mapping.confidence}` : ""}
+    </span>
+  );
 }
 
 const GROUPS: { title: string; statuses: Note["status"][] }[] = [
@@ -37,12 +67,16 @@ function NoteItem({
   currentSha,
   stillBase,
   actions,
+  mapping,
+  viewingLabel,
 }: {
   note: Note;
   active: boolean;
   currentSha: string;
   stillBase: string | null;
   actions: NoteActions;
+  mapping?: NoteMappingDto;
+  viewingLabel: string;
 }) {
   const stale = isStale(note, currentSha);
   const thumb =
@@ -70,9 +104,10 @@ function NoteItem({
             <span className="rounded bg-muted px-1.5 py-px">{STATUS_TEXT[note.status]}</span>
             {stale ? (
               <span className="rounded bg-amber-500/20 px-1.5 py-px text-amber-700 dark:text-amber-300" title={`Written on ${note.versionLabel} (${shortSha(note.mediaSha256)})`}>
-                on {note.versionLabel}
+                from {note.versionLabel}
               </span>
             ) : null}
+            {stale && mapping ? <MappingBadge mapping={mapping} viewingLabel={viewingLabel} /> : null}
           </div>
         </div>
       </div>
@@ -85,6 +120,11 @@ function NoteItem({
         </p>
       ) : null}
       <div className="mt-1.5 flex flex-wrap gap-1" onClick={(event) => event.stopPropagation()}>
+        {note.status === "fixed" && actions.onCheck && note.frameIn !== null ? (
+          <Button size="sm" variant="secondary" className="h-6 px-2 text-xs" onClick={() => actions.onCheck?.(note)}>
+            <Icon name="PanelRight" className="size-3.5" /> Check
+          </Button>
+        ) : null}
         {note.status === "fixed" ? (
           <Button size="sm" variant="secondary" className="h-6 px-2 text-xs" onClick={() => actions.onVerify(note)}>
             <Icon name="Check" className="size-3.5" /> Verify
@@ -122,6 +162,8 @@ export function NotesList({
   stillBase,
   actions,
   header,
+  mappings,
+  viewingLabel,
 }: {
   notes: Note[];
   activeId: string | null;
@@ -129,6 +171,8 @@ export function NotesList({
   stillBase: string | null;
   actions: NoteActions;
   header?: ReactNode;
+  mappings?: Map<string, NoteMappingDto>;
+  viewingLabel: string;
 }) {
   return (
     <div className="flex flex-col gap-3 p-3">
@@ -155,6 +199,8 @@ export function NotesList({
                   currentSha={currentSha}
                   stillBase={stillBase}
                   actions={actions}
+                  mapping={mappings?.get(note.id)}
+                  viewingLabel={viewingLabel}
                 />
               ))}
             </ul>

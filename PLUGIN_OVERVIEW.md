@@ -14,8 +14,17 @@ frame of an exact file, and hand them to an agent in one message.
   attached as a PNG (marked up, plus a crop).
 - Live status on every note: with the agent, fixed (with the new file's
   sha256), agent asks, verified. Only you verify.
-- A banner when the file is re-rendered, and a stale tag on notes written on an
-  older version.
+- Every render kept as a version (v1, v2, …): older renders stay viewable as
+  copy-on-write clones until no open note needs them.
+- Notes follow the video across renders: a note from v1 shows where its moment
+  lands on v2, matched by the render manifest when there is one and by the
+  pictures themselves otherwise, with how sure the match is.
+- Compare two versions on the matching frame: A/B flip, side by side, wipe and
+  difference, plus an exact pixel compare that boxes what changed.
+- "What changed": every timing shift, changed picture and moved scene edge
+  between two renders, each a jump.
+- Check fixes one by one: the fixed render at the right frame, A/B against the
+  original, Verify or Reopen.
 
 ## How it works
 
@@ -28,4 +37,8 @@ stay in the plugin's own storage; nothing leaves the machine.
 The bundled skill tells an agent to check the file's sha256, see each note's
 frame with `bb video-review frame <id>`, fix and re-render, check the frame on
 the new file, and close the note with
-`bb video-review resolve <id> --sha <new sha256> --note "…"`.
+`bb video-review resolve <id> --sha <new sha256> --note "…"`. Agents can also
+compare a note's frame with the new render (`bb video-review compare <id>`),
+list what changed between two renders, attach a render manifest
+(`bb video-review timeline`), and open the review for you at the first fixed
+note (`bb video-review open <video> --frame n --compare v1`).
