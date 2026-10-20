@@ -66,7 +66,7 @@ function NoteItem({
             {note.kind === "range" ? <span>→ {note.frameOut}</span> : null}
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-1">
-            <span className="rounded bg-muted px-1.5 py-px">{note.category}</span>
+            {note.category !== "other" ? <span className="rounded bg-muted px-1.5 py-px">{note.category}</span> : null}
             <span className="rounded bg-muted px-1.5 py-px">{STATUS_TEXT[note.status]}</span>
             {stale ? (
               <span className="rounded bg-amber-500/20 px-1.5 py-px text-amber-700 dark:text-amber-300" title={`Written on ${note.versionLabel} (${shortSha(note.mediaSha256)})`}>
@@ -179,6 +179,7 @@ export function NoteEditor({
   shapeCount,
   busy,
   onClearShapes,
+  onUndoShape,
   onCancel,
   onSubmit,
 }: {
@@ -188,6 +189,7 @@ export function NoteEditor({
   shapeCount: number;
   busy: boolean;
   onClearShapes: () => void;
+  onUndoShape?: () => void;
   onCancel: () => void;
   onSubmit: (value: EditorValue) => void;
 }) {
@@ -226,7 +228,7 @@ export function NoteEditor({
       >
         {NOTE_CATEGORIES.map((category) => (
           <option key={category} value={category}>
-            {category}
+            {category === "other" ? "No category (optional)" : category}
           </option>
         ))}
       </select>
@@ -253,8 +255,16 @@ export function NoteEditor({
           {shapeCount > 0 ? (
             <>
               {shapeCount} mark{shapeCount === 1 ? "" : "s"} ·{" "}
+              {onUndoShape ? (
+                <>
+                  <button type="button" className="underline" title="Undo last mark (⌘Z)" onClick={onUndoShape}>
+                    undo last
+                  </button>{" "}
+                  ·{" "}
+                </>
+              ) : null}
               <button type="button" className="underline" onClick={onClearShapes}>
-                clear
+                clear all
               </button>
             </>
           ) : (

@@ -215,6 +215,12 @@ function Review({
       handled();
       player.current?.pause();
       setTool((value) => (value === "arrow" ? "none" : "arrow"));
+    } else if ((key === "z" || key === "Z") && (event.metaKey || event.ctrlKey) && !pending?.note) {
+      handled();
+      setShapes((current) => current.slice(0, -1));
+    } else if ((key === "Backspace" || key === "Delete") && !pending?.note) {
+      handled();
+      setShapes((current) => current.slice(0, -1));
     } else if (key === ",") {
       handled();
       jumpNote(-1);
@@ -231,7 +237,10 @@ function Review({
       handled();
       if (tool !== "none") setTool("none");
       else if (help) setHelp(false);
-      else setPending(null);
+      else {
+        setPending(null);
+        setShapes([]);
+      }
     }
   };
 
@@ -344,8 +353,11 @@ function Review({
           shapeCount={pending.note ? pending.note.shapes.length : shapes.length}
           busy={saving}
           onClearShapes={() => setShapes([])}
+          onUndoShape={() => setShapes((current) => current.slice(0, -1))}
           onCancel={() => {
             setPending(null);
+            setShapes([]);
+            setTool("none");
             root.current?.focus();
           }}
           onSubmit={(value) => void save(value)}

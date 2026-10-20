@@ -75,3 +75,19 @@ test("markup is spelled out in source pixels", () => {
   });
   assert.ok(text.includes("Marked: box x=1608 y=734 w=288 h=216 px"));
 });
+
+test("a note with no category leaves the category out of the message", () => {
+  const store = memoryStore();
+  const { video, version, note } = seed(store);
+  const n = note({ category: "other" });
+  const text = buildHandoffMessage({
+    absPath: video.absPath,
+    current: version,
+    notes: [n],
+    versions: versions(store, video.id),
+    imageNumbers: new Map(),
+    imagePaths: new Map(),
+  });
+  assert.ok(text.includes(`[${n.id}] v1 00:00:36:22 (922)\n`), text);
+  assert.ok(!text.includes("· other"));
+});

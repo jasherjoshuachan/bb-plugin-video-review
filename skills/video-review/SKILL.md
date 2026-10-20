@@ -9,6 +9,9 @@ The user steps through a rendered video in the Video Review tab and pins notes
 to a frame, an in–out range of frames, or the whole video. The message names
 the exact file and its sha256, then lists each note as
 `[<id>] <version> <timecode> (<frame>) · <category>` followed by the request.
+The category (cut, audio, pip, text, caption, timing) is optional and only a
+hint for where to look. The note's own words are the instruction: when the
+category and the text disagree, follow the text.
 Frame notes come with the frame attached (marked up when the user drew a box
 or an arrow) and, when marked, a crop of that area. The tab shows every note's
 status live, so report each one as you finish it.

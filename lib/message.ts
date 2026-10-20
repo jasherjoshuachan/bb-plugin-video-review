@@ -52,7 +52,7 @@ export function buildHandoffMessage(input: HandoffInput): string {
     const parts = [`[${note.id}] ${noteLocation(note)}`];
     const range = rangeText(note);
     if (range) parts.push(range);
-    parts.push(note.category);
+    if (note.category !== "other") parts.push(note.category);
     const numbers = input.imageNumbers.get(note.id) ?? [];
     const paths = input.imagePaths.get(note.id) ?? [];
     if (numbers.length > 0) parts.push(`${numbers.length === 1 ? "image" : "images"} ${numbers.join(", ")} attached`);
