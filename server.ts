@@ -11,14 +11,16 @@
 // beside the plugin data) is adapted from Doc Review (MIT, (c) 2026 Foma);
 // the preview-URL cache and protected-location checks come from Inline
 // Media. See NOTICE.
-import { readFile, realpath } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { exposesProtectedLocation, isInThreadStorage, isProtectedLocation, type ProtectedOptions } from "./lib/authorize.ts";
-import { videoReviewCli, type FrameFiles } from "./lib/cli.ts";
+import { videoReviewCli, type CompareResult, type FrameFiles } from "./lib/cli.ts";
+import { CrossVersion } from "./lib/crossversion.ts";
+import { parseTimeline } from "./lib/timeline.ts";
 import { rpcContract, type FrameIndexDto } from "./lib/contract.ts";
-import { VideoFiles } from "./lib/files.ts";
+import { joinPath, VideoFiles, type OpenerSource } from "./lib/files.ts";
 import { frameLabel, type FrameIndex } from "./lib/frames.ts";
 import { dataDirFromDatabaseName, joinPreviewUrl } from "./lib/inside.ts";
 import { findTools, VideoMedia } from "./lib/media.ts";
@@ -36,6 +38,10 @@ const STILL_ROUTE = "/still";
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
 const NO_PROJECT = "This file is not in a project, so a new chat cannot be started from here.";
 const VIDEO_EXTENSIONS = ["mp4", "m4v", "mov", "webm"];
+/** An open request written by `bb video-review open`: which video, which frame, which version to compare. */
+const INTENT_EXTENSION = "vreview";
+const INTENT = "video-review-intent";
+const COMPARE_ROUTE = "/compare";
 
 export default async function plugin(bb: BbPluginApi) {
   const database = bb.storage.database();
@@ -58,6 +64,13 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Leave empty to use Homebrew's, /usr/local/bin, or the one on PATH.",
       default: "",
     },
+    snapshotCopyMaxMb: {
+      type: "number",
+      label: "Largest render to copy when it cannot be cloned (MB)",
+      description:
+        "Older renders are kept as copy-on-write clones, which take no space until the original is rewritten. Where cloning is not possible, renders up to this size are copied; bigger ones are not kept.",
+      default: 300,
+    },
   });
   const media = new VideoMedia(async () => findTools(await settings.get()), path.join(dataDir, "stills"));
 
@@ -67,8 +80,49 @@ export default async function plugin(bb: BbPluginApi) {
     dropsDir: null,
   };
 
+  const tools = async () => findTools(await settings.get());
+  const cross = new CrossVersion({
+    store,
+    media,
+    tools,
+    dataDir,
+    maxCopyBytes: async () => Math.max(0, Number((await settings.get()).snapshotCopyMaxMb ?? 300)) * 1e6,
+    log: (message) => bb.log.info(message),
+  });
+
   function publish(videoIds: string[]): void {
     if (videoIds.length > 0) bb.realtime.publish(CHANGED, { videoIds });
+    for (const id of videoIds) {
+      const video = store.getVideo(id);
+      if (video) void cross.prune(video).catch((error: unknown) => bb.log.warn(`prune: ${String(error)}`));
+    }
+  }
+
+  /** Picks up `<video>.timeline.json` beside the video for a version that has no manifest yet. */
+  async function sidecarTimeline(video: VideoRow, version: VideoVersion): Promise<boolean> {
+    if (version.hasTimeline) return false;
+    const candidates = [`${video.absPath}.timeline.json`, video.absPath.replace(/\.[^./]+$/, ".timeline.json")];
+    for (const file of candidates) {
+      const text = await readFile(file, "utf8").catch(() => null);
+      if (text === null) continue;
+      try {
+        parseTimeline(JSON.parse(text), version.frames);
+        store.setTimeline(video.id, version.sha256, text);
+        return true;
+      } catch (error) {
+        bb.log.warn(`${file}: ${String(error)}`);
+      }
+    }
+    return false;
+  }
+
+  /** New versions are kept (cloned) in the background; tabs hear about it when done. */
+  function keepInBackground(video: VideoRow, version: VideoVersion): void {
+    if (version.kept !== "none") return;
+    void cross
+      .keep(video, version)
+      .then(() => publish([video.id]))
+      .catch((error: unknown) => bb.log.warn(`keep ${version.label}: ${String(error)}`));
   }
 
   function requireVideo(videoId: string): VideoRow {
@@ -92,7 +146,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Probes the file on disk now and records it as a version of the video. */
   async function currentVersion(video: VideoRow): Promise<{ index: FrameIndex; version: VideoVersion }> {
     const index = await media.index(video.absPath);
-    const version = store.registerVersion(video.id, {
+    let version = store.registerVersion(video.id, {
       sha256: index.sha256,
       width: index.width,
       height: index.height,
@@ -100,10 +154,31 @@ export default async function plugin(bb: BbPluginApi) {
       fpsDen: index.fps.den,
       frames: index.pts.length,
     });
+    if (await sidecarTimeline(video, version)) version = store.getVersion(video.id, version.sha256) ?? version;
+    keepInBackground(video, version);
     return { index, version };
   }
 
-  /** A short-lived URL the browser streams the video from (bb's preview server handles ranges). */
+  /** A short-lived URL for a file; bb's preview server handles range requests. */
+  async function previewUrl(file: string, refresh: boolean): Promise<{ url: string; expiresAtMs: number }> {
+    const directory = path.dirname(file);
+    const hostId = (await files.localHostId()) ?? undefined;
+    const entry = await previews.obtain(
+      previewCacheKey(hostId, directory),
+      async () => {
+        const preview = await bb.sdk.files.createPreview({
+          ...(hostId ? { hostId } : {}),
+          rootPath: directory,
+          ttlMs: PREVIEW_TTL_MS,
+        });
+        return { baseUrl: preview.baseUrl, expiresAtMs: preview.expiresAtMs ?? Date.now() + PREVIEW_TTL_MS };
+      },
+      refresh,
+    );
+    return { url: joinPreviewUrl(entry.baseUrl, path.basename(file)), expiresAtMs: entry.expiresAtMs };
+  }
+
+  /** The video file as it is on disk; refused from protected folders. */
   async function mediaUrl(video: VideoRow, refresh = false): Promise<{ url: string; expiresAtMs: number }> {
     const directory = path.dirname(video.absPath);
     const realFile = await realpath(video.absPath).catch(() => video.absPath);
@@ -119,20 +194,63 @@ export default async function plugin(bb: BbPluginApi) {
     ) {
       throw new Error("Videos in your home folder itself or in protected folders are not served; move it into a project folder.");
     }
-    const hostId = (await files.localHostId()) ?? undefined;
-    const entry = await previews.obtain(
-      previewCacheKey(hostId, directory),
-      async () => {
-        const preview = await bb.sdk.files.createPreview({
-          ...(hostId ? { hostId } : {}),
-          rootPath: directory,
-          ttlMs: PREVIEW_TTL_MS,
-        });
-        return { baseUrl: preview.baseUrl, expiresAtMs: preview.expiresAtMs ?? Date.now() + PREVIEW_TTL_MS };
-      },
-      refresh,
-    );
-    return { url: joinPreviewUrl(entry.baseUrl, path.basename(video.absPath)), expiresAtMs: entry.expiresAtMs };
+    return previewUrl(video.absPath, refresh);
+  }
+
+  /** Any version: the file on disk when it still has that sha, else the kept snapshot (the plugin's own folder of renders). */
+  async function versionMediaUrl(video: VideoRow, version: VideoVersion, refresh = false): Promise<{ url: string; expiresAtMs: number }> {
+    if ((await media.currentSha(video.absPath)) === version.sha256) return mediaUrl(video, refresh);
+    return previewUrl(await cross.requireFile(video, version), refresh);
+  }
+
+  function requireVersion(video: VideoRow, ref: string): VideoVersion {
+    const version = store.findVersion(video.id, ref) ?? store.getVersion(video.id, ref);
+    if (!version) {
+      const known = store.listVersions(video.id).map((v) => v.label).join(", ") || "none";
+      throw new Error(`No version ${ref} of ${path.basename(video.absPath)} (known: ${known}).`);
+    }
+    return version;
+  }
+
+  async function currentVersionOf(video: VideoRow): Promise<VideoVersion> {
+    return (await currentVersion(video)).version;
+  }
+
+  function compareUrl(file: string): string {
+    return `/api/v1/plugins/${bb.pluginId}/http${COMPARE_ROUTE}?file=${encodeURIComponent(path.basename(file))}`;
+  }
+
+  /** Thread roots a video may be opened from: the workspace and the thread's storage. */
+  async function threadRoots(threadId: string): Promise<Array<{ source: "workspace" | "thread-storage"; root: string; environmentId: string | null }>> {
+    const roots: Array<{ source: "workspace" | "thread-storage"; root: string; environmentId: string | null }> = [];
+    const thread: unknown = await bb.sdk.threads.get({ threadId, include: "environment" }).catch(() => null);
+    const environment = thread && typeof thread === "object" ? (thread as { environment?: unknown }).environment : undefined;
+    if (environment && typeof environment === "object") {
+      const env = environment as { path?: unknown; id?: unknown };
+      if (typeof env.path === "string" && env.path) roots.push({ source: "workspace", root: env.path, environmentId: typeof env.id === "string" ? env.id : null });
+    }
+    const storage = await bb.sdk.threads.storageLocation({ threadId });
+    roots.push({ source: "thread-storage", root: storage.storageRootPath, environmentId: null });
+    return roots;
+  }
+
+  interface Intent {
+    video: { source: "workspace" | "thread-storage"; path: string; environmentId: string | null; threadId: string };
+    frame: number | null;
+    compare: string | null;
+    at: number;
+  }
+
+  async function readIntent(rawPath: string, source: OpenerSource): Promise<{ absPath: string; intent: Intent }> {
+    const intentFile = await files.resolve(rawPath, source);
+    const parsed = JSON.parse(await readFile(intentFile, "utf8")) as Intent;
+    if (!parsed?.video || typeof parsed.video.path !== "string" || !["workspace", "thread-storage"].includes(parsed.video.source)) {
+      throw new Error("This .vreview file does not name a video.");
+    }
+    const roots = await threadRoots(parsed.video.threadId);
+    const root = roots.find((r) => r.source === parsed.video.source);
+    if (!root) throw new Error("The thread this review was opened from has no such folder.");
+    return { absPath: joinPath(root.root, parsed.video.path), intent: parsed };
   }
 
   function versionsBySha(videoId: string): Map<string, VideoVersion> {
@@ -199,14 +317,91 @@ export default async function plugin(bb: BbPluginApi) {
     }
   });
 
+  bb.http.route("GET", COMPARE_ROUTE, async (context) => {
+    const name = context.req.query("file") ?? "";
+    if (!/^[0-9a-f]{12}-\d+-vs-[0-9a-f]{12}-\d+-(a|b|diff)\.png$/.test(name)) return context.text("Not found", 404);
+    try {
+      const bytes = await readFile(path.join(dataDir, "compare", name));
+      return new Response(new Uint8Array(bytes), { headers: { "content-type": "image/png", "cache-control": "private, max-age=3600" } });
+    } catch {
+      return context.text("Not found", 404);
+    }
+  });
+
   bb.rpc.register(rpcContract, {
     async "video.open"({ path: rawPath, source }) {
       const extension = rawPath.split(".").pop()?.toLowerCase() ?? "";
-      if (!VIDEO_EXTENSIONS.includes(extension)) throw new Error(`Video Review opens ${VIDEO_EXTENSIONS.map((e) => `.${e}`).join(", ")} files.`);
-      const absPath = await files.resolve(rawPath, source);
+      let absPath: string;
+      let intent: { frame: number | null; compare: string | null } | null = null;
+      if (extension === INTENT_EXTENSION) {
+        const read = await readIntent(rawPath, source);
+        absPath = read.absPath;
+        intent = { frame: read.intent.frame, compare: read.intent.compare };
+      } else {
+        if (!VIDEO_EXTENSIONS.includes(extension)) throw new Error(`Video Review opens ${VIDEO_EXTENSIONS.map((e) => `.${e}`).join(", ")} files.`);
+        absPath = await files.resolve(rawPath, source);
+      }
       const video = store.upsertVideo(null, absPath);
       const { index, version } = await currentVersion(video);
-      return { video: toReviewVideo(video), version, index: indexDto(index), media: await mediaUrl(video) };
+      return { video: toReviewVideo(video), version, index: indexDto(index), media: await mediaUrl(video), intent };
+    },
+
+    async "versions.list"({ videoId }) {
+      const video = requireVideo(videoId);
+      return { versions: store.listVersions(videoId), currentSha: await media.currentSha(video.absPath) };
+    },
+
+    async "versions.load"({ videoId, sha256 }) {
+      const video = requireVideo(videoId);
+      const version = requireVersion(video, sha256);
+      const { index } = await cross.indexFor(video, version);
+      return { version, index: indexDto(index), media: await versionMediaUrl(video, version) };
+    },
+
+    async "versions.mediaUrl"({ videoId, sha256, refresh }) {
+      const video = requireVideo(videoId);
+      return versionMediaUrl(video, requireVersion(video, sha256), refresh ?? false);
+    },
+
+    async "versions.maps"({ videoId, fromSha, toSha }) {
+      const video = requireVideo(videoId);
+      const from = requireVersion(video, fromSha);
+      const to = requireVersion(video, toSha);
+      if (from.sha256 === to.sha256) {
+        const same = Array.from({ length: from.frames }, (_, i) => i);
+        return { forward: same, backward: same };
+      }
+      return cross.frameMaps(video, from, to);
+    },
+
+    async "versions.report"({ videoId, fromSha, toSha }) {
+      const video = requireVideo(videoId);
+      return cross.report(video, requireVersion(video, fromSha), requireVersion(video, toSha));
+    },
+
+    async "notes.mapped"({ videoId, toSha }) {
+      const video = requireVideo(videoId);
+      const to = requireVersion(video, toSha);
+      const mappings = [];
+      for (const note of store.listNotes(videoId)) {
+        if (note.mediaSha256 === to.sha256 || note.kind === "general" || note.frameIn === null) continue;
+        mappings.push(await cross.mapNote(video, note, to));
+      }
+      return { mappings };
+    },
+
+    async "compare.frames"({ videoId, aSha, aFrame, bSha, bFrame }) {
+      const video = requireVideo(videoId);
+      const a = requireVersion(video, aSha);
+      const b = requireVersion(video, bSha);
+      const target = bFrame ?? (await cross.matchFrame(video, a, b, aFrame)).frame;
+      const result = await cross.compare(video, { version: a, frame: aFrame }, { version: b, frame: target });
+      return {
+        aFrame,
+        bFrame: target,
+        diff: result.diff,
+        urls: { a: compareUrl(result.files.a), b: compareUrl(result.files.b), difference: compareUrl(result.files.difference) },
+      };
     },
 
     async "video.state"({ videoId }) {
@@ -435,12 +630,140 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
+  function videoFor(file: string): VideoRow {
+    const known = store.findVideosByPath(file);
+    if (known.length > 0) return known[0];
+    return store.upsertVideo(null, file);
+  }
+
+  function diffLines(label: string, diff: { mean: number; max: number; changedShare: number; box: { x: number; y: number; w: number; h: number } | null }): string {
+    const where = diff.box ? `changed area x=${diff.box.x} y=${diff.box.y} w=${diff.box.w} h=${diff.box.h} px` : "no pixel changed by more than the threshold";
+    return `${label}: mean difference ${diff.mean}, max ${diff.max}, ${(diff.changedShare * 100).toFixed(2)}% of pixels changed; ${where}`;
+  }
+
+  async function compareNote(note: NoteWithVideo, toRef: string | null): Promise<CompareResult> {
+    const video = note.video;
+    const to = toRef ? requireVersion(video, toRef) : await currentVersionOf(video);
+    const from = store.getVersion(video.id, note.mediaSha256);
+    if (!from) throw new Error(`The version ${note.versionLabel} is not known.`);
+    const mapping = await cross.mapNote(video, note, to);
+    if (mapping.frameIn === null) {
+      return {
+        text: `${note.id}: frame ${note.frameIn} of ${from.label} has no reliable match on ${to.label}.`,
+        data: { mapping },
+      };
+    }
+    const result = await cross.compare(video, { version: from, frame: note.frameIn! }, { version: to, frame: mapping.frameIn });
+    const lines = [
+      `${note.id}: ${from.label} frame ${note.frameIn} -> ${to.label} frame ${mapping.frameIn} (${mapping.method}, ${mapping.confidence} confidence, moved ${mapping.shifted >= 0 ? "+" : ""}${mapping.shifted} frames)`,
+      ...(mapping.manifest && mapping.content && mapping.manifest.frame !== mapping.content.frame
+        ? [`  manifest says frame ${mapping.manifest.frame} (${mapping.manifest.by} ${mapping.manifest.id}, ${mapping.manifest.fit}); picture match says ${mapping.content.frame}`]
+        : []),
+      diffLines("  pixels", result.diff),
+      `  ${from.label}: ${result.files.a}`,
+      `  ${to.label}: ${result.files.b}`,
+      `  difference: ${result.files.difference}`,
+    ];
+    return { text: lines.join("\n"), data: { mapping, diff: result.diff, files: result.files } };
+  }
+
+  async function compareVersions(file: string, aRef: string, bRef: string, frame: number | null): Promise<CompareResult> {
+    const video = videoFor(file);
+    await currentVersion(video).catch(() => null);
+    const a = requireVersion(video, aRef);
+    const b = requireVersion(video, bRef);
+    if (frame !== null) {
+      if (frame >= a.frames) throw new Error(`${a.label} has frames 0–${a.frames - 1}.`);
+      const match = await cross.matchFrame(video, a, b, frame);
+      const result = await cross.compare(video, { version: a, frame }, { version: b, frame: match.frame });
+      const lines = [
+        `${a.label} frame ${frame} -> ${b.label} frame ${match.frame} (${match.confidence} confidence, moved ${match.shifted >= 0 ? "+" : ""}${match.shifted})`,
+        diffLines("pixels", result.diff),
+        `${a.label}: ${result.files.a}`,
+        `${b.label}: ${result.files.b}`,
+        `difference: ${result.files.difference}`,
+      ];
+      return { text: lines.join("\n"), data: { match, diff: result.diff, files: result.files } };
+    }
+    const report = await cross.report(video, a, b);
+    const fps = a.fpsNum / a.fpsDen;
+    const at = (f: number) => `${f} (${(f / fps).toFixed(2)} s)`;
+    const lines = [`${a.label} -> ${b.label}: ${(report.content.matched * 100).toFixed(1)}% of frames matched (aligned in ${report.content.ms} ms)`];
+    lines.push(report.content.shifts.length === 0 ? "Timing: no shifts." : "Timing shifts (by picture):");
+    for (const s of report.content.shifts) {
+      lines.push(`  from ${a.label} frame ${at(s.oldFrame)}: ${s.delta > 0 ? "+" : ""}${s.delta} frames (now ${s.offsetAfter >= 0 ? "+" : ""}${s.offsetAfter} vs ${a.label})`);
+    }
+    const changed = report.content.changes;
+    lines.push(changed.length === 0 ? "Pictures: no changes above the noise." : "Pictures that differ (frames of " + b.label + "):");
+    for (const c of changed) {
+      lines.push(`  ${c.kind}: ${c.from === c.to ? at(c.from) : `${at(c.from)} – ${at(c.to)}`}, max difference ${c.maxDistance}`);
+    }
+    for (const r of report.content.removals) lines.push(`  removed from ${a.label}: frames ${at(r.from)} – ${at(r.to)}`);
+    if (report.boundaries) {
+      lines.push(report.boundaries.length === 0 ? "Manifest: no scene or section edge moved." : "Manifest edges that moved:");
+      for (const d of report.boundaries) lines.push(`  ${d.by} ${d.id} ${d.edge}: ${at(d.oldFrame)} -> ${at(d.newFrame)} (${d.delta > 0 ? "+" : ""}${d.delta})`);
+      if (report.spans && (report.spans.added.length || report.spans.removed.length)) {
+        lines.push(`  added: ${report.spans.added.join(", ") || "none"}; removed: ${report.spans.removed.join(", ") || "none"}`);
+      }
+    } else {
+      lines.push(`Manifest: not stored for both versions (bb ${"video-review"} timeline <video> <json>).`);
+    }
+    return { text: lines.join("\n"), data: report };
+  }
+
+  async function registerTimeline(file: string, jsonText: string) {
+    const video = videoFor(file);
+    const { version } = await currentVersion(video);
+    let parsed;
+    try {
+      parsed = parseTimeline(JSON.parse(jsonText), version.frames);
+    } catch (error) {
+      throw new Error(error instanceof SyntaxError ? `The manifest is not valid JSON: ${error.message}` : (error as Error).message);
+    }
+    store.setTimeline(video.id, version.sha256, jsonText);
+    return { label: version.label, sha256: version.sha256, sections: parsed.sections.length, scenes: parsed.scenes.length };
+  }
+
+  async function openInThread(file: string, options: { threadId: string; frame: number | null; compare: string | null }): Promise<string> {
+    const extension = file.split(".").pop()?.toLowerCase() ?? "";
+    if (!VIDEO_EXTENSIONS.includes(extension)) throw new Error(`Video Review opens ${VIDEO_EXTENSIONS.map((e) => `.${e}`).join(", ")} files.`);
+    const roots = await threadRoots(options.threadId);
+    const real = await realpath(file).catch(() => null);
+    if (!real) throw new Error(`No such file: ${file}`);
+    const root = roots.find((r) => file === r.root || file.startsWith(r.root.endsWith("/") ? r.root : `${r.root}/`));
+    if (!root) {
+      throw new Error("The video must be in this thread's workspace or its thread storage (bb opens files only from there).");
+    }
+    const video = videoFor(file);
+    const { version } = await currentVersion(video);
+    if (options.frame !== null && options.frame >= version.frames) throw new Error(`${version.label} has frames 0–${version.frames - 1}.`);
+    if (options.compare) requireVersion(video, options.compare);
+    const storage = roots.find((r) => r.source === "thread-storage")!;
+    const intent: Intent = {
+      video: { source: root.source, path: path.posix.relative(root.root, file), environmentId: root.environmentId, threadId: options.threadId },
+      frame: options.frame,
+      compare: options.compare,
+      at: Date.now(),
+    };
+    const relative = path.posix.join("video-review", `${path.basename(file)}.${INTENT_EXTENSION}`);
+    await mkdir(path.join(storage.root, "video-review"), { recursive: true });
+    await writeFile(path.join(storage.root, relative), JSON.stringify(intent, null, 2));
+    // A tab already showing this video jumps; a new tab reads the intent file.
+    bb.realtime.publish(INTENT, { videoId: video.id, frame: options.frame, compare: options.compare });
+    await bb.sdk.threads.open({ threadId: options.threadId, split: "right", file: { source: "thread-storage", path: relative, lineNumber: null } });
+    return `Opened ${path.basename(file)} (${version.label}) in Video Review${options.frame !== null ? ` at frame ${options.frame}` : ""}${options.compare ? `, comparing with ${options.compare}` : ""}.`;
+  }
+
   bb.cli.register(
     videoReviewCli({
       store,
       onChanged: publish,
       currentSha: (video) => media.currentSha(video.absPath),
       frameFiles,
+      registerTimeline,
+      compareNote,
+      compareVersions,
+      open: openInThread,
     }),
   );
 }

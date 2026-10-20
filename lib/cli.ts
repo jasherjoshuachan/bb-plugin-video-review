@@ -4,6 +4,7 @@
 // What changes for video: `resolve` needs the sha256 of the re-rendered file,
 // which must be the file on disk now and differ from the one the note was
 // written on; agents can mark a note fixed or answer it, never verified.
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   PluginCliError,
@@ -29,6 +30,13 @@ export interface FrameFiles {
   sha256: string;
 }
 
+export interface CompareResult {
+  /** Human-readable lines. */
+  text: string;
+  /** Machine-readable result. */
+  data: unknown;
+}
+
 export interface CliDeps {
   store: ReviewStore;
   onChanged: (videoIds: string[]) => void;
@@ -36,6 +44,23 @@ export interface CliDeps {
   currentSha: (video: VideoRow) => Promise<string | null>;
   /** The note's frozen stills, or (current) the same frame from the file on disk now. */
   frameFiles: (note: NoteWithVideo, options: { current: boolean }) => Promise<FrameFiles>;
+  /** Stores a render manifest for the version of `file` on disk now. */
+  registerTimeline?: (file: string, jsonText: string) => Promise<{ label: string; sha256: string; sections: number; scenes: number }>;
+  /** A note's frame on its version against where it lands on another version (default: the file on disk now). */
+  compareNote?: (note: NoteWithVideo, to: string | null) => Promise<CompareResult>;
+  /** Two versions of a file: the change report, or one frame compared when `frame` is given. */
+  compareVersions?: (file: string, a: string, b: string, frame: number | null) => Promise<CompareResult>;
+  /** Opens the review tab in a thread on `file`, optionally at a frame and comparing with a version. */
+  open?: (file: string, options: { threadId: string; frame: number | null; compare: string | null }) => Promise<string>;
+}
+
+function absoluteFrom(cwd: string | undefined, file: string): string {
+  return path.posix.isAbsolute(file) ? path.posix.normalize(file) : path.posix.resolve(cwd ?? "/", file);
+}
+
+function need<T>(value: T | undefined, what: string): T {
+  if (value === undefined) throw new PluginCliError(`${what} is not available in this version of the plugin.`, { code: "unsupported" });
+  return value;
 }
 
 function formatNote(note: NoteWithVideo): string {
@@ -265,6 +290,105 @@ export function videoReviewCli(deps: CliDeps): PluginCliRegistration {
             exitCode: 0,
             stdout: `Marked fixed in ${shortSha(sha)}: ${fixed.map((n) => `${n.id} (#${n.seq})`).join(", ")}. The user verifies them.`,
           };
+        },
+      }),
+      timeline: cliCommand({
+        summary: "Attach a render manifest (sections and scenes) to the version of a video on disk now",
+        description:
+          'The manifest is JSON: { "fps": 25, "duration": 515.8, "sections": [{ "id", "t0", "t1" }], "scenes": [{ "id", "kind", "t0", "t1" }] } in seconds. With a manifest on both versions, notes map across renders by scene and offset. A `<video>.timeline.json` next to the video is picked up on its own.',
+        positionals: [
+          { name: "file", description: "The video", required: true },
+          { name: "manifest", description: "The manifest JSON file", required: true },
+        ],
+        options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
+        async run(input, ctx) {
+          const register = need(deps.registerTimeline, "timeline");
+          const file = absoluteFrom(ctx.cwd, input.positionals.file);
+          const manifestPath = absoluteFrom(ctx.cwd, input.positionals.manifest);
+          let text: string;
+          try {
+            text = await readFile(manifestPath, "utf8");
+          } catch {
+            throw new PluginCliError(`Cannot read ${manifestPath}.`, { code: "file_missing" });
+          }
+          let result;
+          try {
+            result = await register(file, text);
+          } catch (error) {
+            throw new PluginCliError(error instanceof Error ? error.message : String(error), { code: "invalid_value" });
+          }
+          onChanged(store.findVideosByPath(file).map((video) => video.id));
+          if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(result) };
+          return {
+            exitCode: 0,
+            stdout: `Manifest stored for ${result.label} (sha256 ${shortSha(result.sha256)}): ${result.sections} sections, ${result.scenes} scenes.`,
+          };
+        },
+      }),
+      compare: cliCommand({
+        summary: "Compare renders: a note's frame against the new render, or two versions of a video",
+        description:
+          "`compare <note id> [--to vN]`: the note's frame on the version it was written on against where it lands on vN (default: the file on disk now), with a pixel difference image. `compare --file <video> --versions v1 v2`: what changed between two renders (timing shifts, changed pictures, scene edges). Add `--frame <n>` (a frame of the first version) for a pixel compare at that moment.",
+        positionals: [{ name: "id", description: "Note id (or use --file with --versions)", required: false }],
+        options: {
+          to: { type: "string", description: "With a note id: the version to compare against (v2, or a sha256 prefix)" },
+          file: { type: "string", description: "The video, with --versions", aliases: ["path"] },
+          versions: { type: "string", description: "Two versions, like v1,v2 (or v1 v2 quoted)" },
+          frame: { type: "integer", description: "With --versions: a frame of the first version to compare pixel by pixel", min: 0, max: 100_000_000 },
+          json: { type: "boolean", description: "Emit machine-readable JSON" },
+        },
+        async run(input, ctx) {
+          let result: CompareResult;
+          if (input.positionals.id) {
+            if (input.options.file || input.options.versions) {
+              throw new PluginCliError("Give a note id, or --file with --versions, not both.", { code: "invalid_value" });
+            }
+            const note = requireNote(input.positionals.id);
+            if (note.kind === "general" || note.frameIn === null) {
+              throw new PluginCliError("This note is about the whole video; it has no frame to compare.", { code: "no_frame" });
+            }
+            result = await need(deps.compareNote, "compare")(note, input.options.to?.trim() || null);
+          } else {
+            if (!input.options.file || !input.options.versions) {
+              throw new PluginCliError("Give a note id, or --file <video> --versions v1,v2.", {
+                code: "missing_required",
+                hint: `bb ${CLI_NAME} compare --file out/video.mp4 --versions v1,v2`,
+              });
+            }
+            const pair = input.options.versions.split(/[\s,]+/).filter(Boolean);
+            if (pair.length !== 2) {
+              throw new PluginCliError("--versions takes exactly two versions, like v1,v2.", { code: "invalid_value" });
+            }
+            result = await need(deps.compareVersions, "compare")(
+              absoluteFrom(ctx.cwd, input.options.file),
+              pair[0],
+              pair[1],
+              input.options.frame ?? null,
+            );
+          }
+          if (input.options.json) return { exitCode: 0, stdout: JSON.stringify(result.data) };
+          return { exitCode: 0, stdout: result.text };
+        },
+      }),
+      open: cliCommand({
+        summary: "Open a video in the Video Review tab of this thread",
+        description:
+          "The video must be in this thread's workspace or thread storage. --frame jumps to a frame; --compare vN opens the compare view against that version (use it after a re-render, at the first fixed note).",
+        positionals: [{ name: "file", description: "The video", required: true }],
+        options: {
+          frame: { type: "integer", description: "Frame to show", min: 0, max: 100_000_000 },
+          compare: { type: "string", description: "A version to compare with (v1, or a sha256 prefix)" },
+        },
+        async run(input, ctx) {
+          if (!ctx.threadId) {
+            throw new PluginCliError("Run this inside a bb thread; the tab opens in that thread.", { code: "no_thread" });
+          }
+          const message = await need(deps.open, "open")(absoluteFrom(ctx.cwd, input.positionals.file), {
+            threadId: ctx.threadId,
+            frame: input.options.frame ?? null,
+            compare: input.options.compare?.trim() || null,
+          });
+          return { exitCode: 0, stdout: message };
         },
       }),
       reply: cliCommand({

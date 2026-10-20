@@ -50,6 +50,8 @@ const versionSchema = z.object({
   fpsDen: z.number(),
   frames: z.number(),
   firstSeenAt: z.number(),
+  kept: z.enum(["clone", "copy", "none", "pruned"]),
+  hasTimeline: z.boolean(),
 });
 
 const videoSchema = z.object({ id: z.string(), absPath: z.string(), name: z.string() });
@@ -89,13 +91,146 @@ const sendTargetSchema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 
+const confidenceSchema = z.enum(["high", "medium", "low", "none"]);
+
+const noteMappingSchema = z.object({
+  noteId: z.string(),
+  fromSha: z.string(),
+  toSha: z.string(),
+  frameIn: z.number().nullable(),
+  frameOut: z.number().nullable(),
+  method: z.enum(["manifest", "content", "same-file", "none"]),
+  confidence: confidenceSchema,
+  shifted: z.number(),
+  unmappable: z.boolean(),
+  manifest: z
+    .object({
+      frame: z.number(),
+      frameOut: z.number().nullable(),
+      by: z.enum(["scene", "section"]),
+      id: z.string(),
+      offset: z.number(),
+      fit: z.enum(["exact", "resized", "clamped"]),
+    })
+    .nullable(),
+  content: z
+    .object({ frame: z.number(), frameOut: z.number().nullable(), confidence: confidenceSchema, shifted: z.number() })
+    .nullable(),
+});
+
+const boxSchema = z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() });
+const pixelDiffSchema = z.object({
+  width: z.number(),
+  height: z.number(),
+  mean: z.number(),
+  max: z.number(),
+  changedShare: z.number(),
+  box: boxSchema.nullable(),
+  threshold: z.number(),
+});
+
+const reportSchema = z.object({
+  from: versionSchema,
+  to: versionSchema,
+  content: z.object({
+    shifts: z.array(
+      z.object({
+        oldFrame: z.number(),
+        newFrame: z.number(),
+        offsetBefore: z.number(),
+        offsetAfter: z.number(),
+        delta: z.number(),
+        span: z.number(),
+      }),
+    ),
+    changes: z.array(
+      z.object({
+        kind: z.enum(["changed", "slight", "inserted"]),
+        from: z.number(),
+        to: z.number(),
+        oldFrom: z.number(),
+        oldTo: z.number(),
+        maxDistance: z.number(),
+      }),
+    ),
+    removals: z.array(z.object({ from: z.number(), to: z.number(), at: z.number() })),
+    matched: z.number(),
+    ms: z.number(),
+  }),
+  boundaries: z
+    .array(
+      z.object({
+        by: z.enum(["scene", "section"]),
+        id: z.string(),
+        edge: z.enum(["start", "end"]),
+        oldFrame: z.number(),
+        newFrame: z.number(),
+        delta: z.number(),
+      }),
+    )
+    .nullable(),
+  spans: z.object({ added: z.array(z.string()), removed: z.array(z.string()) }).nullable(),
+});
+
 const TEXT_MAX = 8000;
 const idInput = z.object({ id: z.string() }).strict();
 
 export const rpcContract = defineRpcContract({
   "video.open": {
     input: z.object({ path: z.string().min(1), source: openerSourceSchema }).strict(),
-    output: z.object({ video: videoSchema, version: versionSchema, index: frameIndexSchema, media: mediaSchema }),
+    output: z.object({
+      video: videoSchema,
+      version: versionSchema,
+      index: frameIndexSchema,
+      media: mediaSchema,
+      /** Set when the tab was opened through `bb video-review open` (a .vreview file). */
+      intent: z.object({ frame: z.number().nullable(), compare: z.string().nullable() }).nullable(),
+    }),
+  },
+  "versions.list": {
+    input: z.object({ videoId: z.string() }).strict(),
+    output: z.object({ versions: z.array(versionSchema), currentSha: z.string().nullable() }),
+  },
+  /** Any version's frame index and a media URL (the file on disk, or the kept snapshot). */
+  "versions.load": {
+    input: z.object({ videoId: z.string(), sha256: z.string() }).strict(),
+    output: z.object({ version: versionSchema, index: frameIndexSchema, media: mediaSchema }),
+  },
+  "versions.mediaUrl": {
+    input: z.object({ videoId: z.string(), sha256: z.string(), refresh: z.boolean().optional() }).strict(),
+    output: mediaSchema,
+  },
+  /** Frame maps between two versions: forward[i] = matching frame of `to` for frame i of `from`. */
+  "versions.maps": {
+    input: z.object({ videoId: z.string(), fromSha: z.string(), toSha: z.string() }).strict(),
+    output: z.object({ forward: z.array(z.number()), backward: z.array(z.number()) }),
+  },
+  "versions.report": {
+    input: z.object({ videoId: z.string(), fromSha: z.string(), toSha: z.string() }).strict(),
+    output: reportSchema,
+  },
+  /** Where notes written on other versions land on `toSha`. */
+  "notes.mapped": {
+    input: z.object({ videoId: z.string(), toSha: z.string() }).strict(),
+    output: z.object({ mappings: z.array(noteMappingSchema) }),
+  },
+  /** Pixel compare of a frame of A with its match (or a given frame) on B. */
+  "compare.frames": {
+    input: z
+      .object({
+        videoId: z.string(),
+        aSha: z.string(),
+        aFrame: z.number().int().min(0),
+        bSha: z.string(),
+        bFrame: z.number().int().min(0).optional(),
+      })
+      .strict(),
+    output: z.object({
+      aFrame: z.number(),
+      bFrame: z.number(),
+      diff: pixelDiffSchema,
+      urls: z.object({ a: z.string(), b: z.string(), difference: z.string() }),
+    }),
   },
   /** Cheap check for a re-render: the sha of the file on disk now. */
   "video.state": {
@@ -178,3 +313,6 @@ export const rpcContract = defineRpcContract({
 export type RpcContract = typeof rpcContract;
 export type FrameIndexDto = z.infer<typeof frameIndexSchema>;
 export type MediaDto = z.infer<typeof mediaSchema>;
+export type NoteMappingDto = z.infer<typeof noteMappingSchema>;
+export type ReportDto = z.infer<typeof reportSchema>;
+export type PixelDiffDto = z.infer<typeof pixelDiffSchema>;

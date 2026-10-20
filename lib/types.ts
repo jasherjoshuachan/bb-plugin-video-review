@@ -68,6 +68,10 @@ export interface VideoVersion {
   fpsDen: number;
   frames: number;
   firstSeenAt: number;
+  /** Whether an older render stays viewable: clone or copy kept, none, or pruned once no note needed it. */
+  kept: "clone" | "copy" | "none" | "pruned";
+  /** A render manifest (sections and scenes) is stored for this version. */
+  hasTimeline: boolean;
 }
 
 export interface ReviewVideo {

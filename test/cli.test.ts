@@ -123,3 +123,77 @@ test("frame prints the stills; a whole-video note has none", async () => {
   const none = await run("frame", general.id);
   assert.notEqual(none.exitCode, 0);
 });
+
+function setupStep2() {
+  const store = memoryStore();
+  const seeded = seed(store);
+  const calls: Array<{ fn: string; args: unknown[] }> = [];
+  const cli = videoReviewCli({
+    store,
+    onChanged: () => {},
+    currentSha: async () => SHA_B,
+    frameFiles: async () => ({ frame: 0, sha256: SHA_A, files: [] }),
+    registerTimeline: async (file, text) => {
+      calls.push({ fn: "timeline", args: [file, text] });
+      return { label: "v1", sha256: SHA_A, sections: 2, scenes: 3 };
+    },
+    compareNote: async (note, to) => {
+      calls.push({ fn: "compareNote", args: [note.id, to] });
+      return { text: "compared", data: { ok: true } };
+    },
+    compareVersions: async (file, a, b, frame) => {
+      calls.push({ fn: "compareVersions", args: [file, a, b, frame] });
+      return { text: "report", data: { a, b } };
+    },
+    open: async (file, options) => {
+      calls.push({ fn: "open", args: [file, options] });
+      return "opened";
+    },
+  });
+  return { store, cli, calls, ...seeded };
+}
+
+test("compare needs a note id or --file with two --versions", async () => {
+  const { cli, calls, note } = setupStep2();
+  const run = (...argv: string[]) => cli.run(argv, { threadId: "thr_1", cwd: "/work" });
+  assert.match(String((await run("compare")).stderr), /note id, or --file/);
+  assert.match(String((await run("compare", "--file", "out/v.mp4", "--versions", "v1")).stderr), /exactly two/);
+  const n = note();
+  assert.match(String((await run("compare", n.id, "--file", "x.mp4", "--versions", "v1,v2")).stderr), /not both/);
+  assert.equal((await run("compare", n.id, "--to", "v2")).stdout, "compared");
+  assert.equal((await run("compare", "--file", "out/v.mp4", "--versions", "v1 v2", "--frame", "12", "--json")).stdout, JSON.stringify({ a: "v1", b: "v2" }));
+  assert.deepEqual(calls.map((c) => c.args), [
+    [n.id, "v2"],
+    ["/work/out/v.mp4", "v1", "v2", 12],
+  ]);
+});
+
+test("compare refuses a whole-video note", async () => {
+  const { cli, note } = setupStep2();
+  const n = note({ kind: "general", frameIn: null, frameOut: null });
+  const result = await cli.run(["compare", n.id], { threadId: "thr_1", cwd: "/work" });
+  assert.match(String(result.stderr), /whole video/);
+});
+
+test("open needs a thread and resolves the path from the working directory", async () => {
+  const { cli, calls } = setupStep2();
+  const noThread = await cli.run(["open", "out/v.mp4"], { threadId: null, cwd: "/work" } as never);
+  assert.match(String(noThread.stderr), /inside a bb thread/);
+  const ok = await cli.run(["open", "out/v.mp4", "--frame", "40", "--compare", "v1"], { threadId: "thr_9", cwd: "/work" });
+  assert.equal(ok.stdout, "opened");
+  assert.deepEqual(calls.at(-1)?.args, ["/work/out/v.mp4", { threadId: "thr_9", frame: 40, compare: "v1" }]);
+});
+
+test("timeline reads the manifest file and reports a bad one", async () => {
+  const { cli, calls } = setupStep2();
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "vr-cli-"));
+  writeFileSync(join(dir, "t.json"), '{"fps":25}');
+  const ok = await cli.run(["timeline", "out/v.mp4", join(dir, "t.json")], { threadId: "thr_1", cwd: "/work" });
+  assert.match(String(ok.stdout), /2 sections, 3 scenes/);
+  assert.deepEqual(calls.at(-1)?.args, ["/work/out/v.mp4", '{"fps":25}']);
+  const missing = await cli.run(["timeline", "out/v.mp4", join(dir, "nope.json")], { threadId: "thr_1", cwd: "/work" });
+  assert.match(String(missing.stderr), /Cannot read/);
+});

@@ -79,6 +79,10 @@ export const MIGRATIONS = [
    )`,
   `CREATE INDEX notes_video ON notes(video_id, seq)`,
   `CREATE INDEX notes_status ON notes(status, sent_thread_id)`,
+  // Step 2: kept snapshots of older renders and their render manifests.
+  `ALTER TABLE versions ADD COLUMN kept TEXT NOT NULL DEFAULT 'none'`,
+  `ALTER TABLE versions ADD COLUMN snapshot_path TEXT`,
+  `ALTER TABLE versions ADD COLUMN timeline TEXT`,
 ];
 
 export interface VideoRow {
@@ -102,6 +106,9 @@ interface RawVersion {
   fps_den: number;
   frames: number;
   first_seen_at: number;
+  kept: string;
+  snapshot_path: string | null;
+  timeline: string | null;
 }
 
 interface RawNote {
@@ -183,6 +190,8 @@ function toVersion(raw: RawVersion): VideoVersion {
     fpsDen: raw.fps_den,
     frames: raw.frames,
     firstSeenAt: raw.first_seen_at,
+    kept: (raw.kept ?? "none") as VideoVersion["kept"],
+    hasTimeline: raw.timeline !== null && raw.timeline !== undefined,
   };
 }
 
@@ -286,6 +295,44 @@ export class ReviewStore {
       .prepare(`SELECT * FROM versions WHERE video_id = ? AND sha256 = ?`)
       .get(videoId, sha256) as RawVersion | undefined;
     return raw ? toVersion(raw) : null;
+  }
+
+  /** A version by its label (v1, v2, …) or a sha256 prefix of at least 8 characters. */
+  findVersion(videoId: string, ref: string): VideoVersion | null {
+    const wanted = ref.trim().toLowerCase();
+    const all = this.listVersions(videoId);
+    const byLabel = all.find((v) => v.label === wanted);
+    if (byLabel) return byLabel;
+    if (/^[0-9a-f]{8,64}$/.test(wanted)) {
+      const matches = all.filter((v) => v.sha256.startsWith(wanted));
+      if (matches.length === 1) return matches[0];
+    }
+    return null;
+  }
+
+  setKept(videoId: string, sha256: string, kept: VideoVersion["kept"], snapshotPath: string | null): void {
+    this.db
+      .prepare(`UPDATE versions SET kept = ?, snapshot_path = ? WHERE video_id = ? AND sha256 = ?`)
+      .run(kept, snapshotPath, videoId, sha256);
+  }
+
+  snapshotOf(videoId: string, sha256: string): string | null {
+    const row = this.db
+      .prepare(`SELECT snapshot_path FROM versions WHERE video_id = ? AND sha256 = ? AND kept IN ('clone', 'copy')`)
+      .get(videoId, sha256) as { snapshot_path: string | null } | undefined;
+    return row?.snapshot_path ?? null;
+  }
+
+  /** Stores a render manifest for one version (raw JSON text, already validated). */
+  setTimeline(videoId: string, sha256: string, json: string | null): void {
+    this.db.prepare(`UPDATE versions SET timeline = ? WHERE video_id = ? AND sha256 = ?`).run(json, videoId, sha256);
+  }
+
+  timelineOf(videoId: string, sha256: string): string | null {
+    const row = this.db.prepare(`SELECT timeline FROM versions WHERE video_id = ? AND sha256 = ?`).get(videoId, sha256) as
+      | { timeline: string | null }
+      | undefined;
+    return row?.timeline ?? null;
   }
 
   listVersions(videoId: string): VideoVersion[] {
