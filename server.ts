@@ -11,11 +11,11 @@
 // beside the plugin data) is adapted from Doc Review (MIT, (c) 2026 Foma);
 // the preview-URL cache and protected-location checks come from Inline
 // Media. See NOTICE.
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
-import { exposesProtectedLocation, isProtectedLocation, type ProtectedOptions } from "./lib/authorize.ts";
+import { exposesProtectedLocation, isInThreadStorage, isProtectedLocation, type ProtectedOptions } from "./lib/authorize.ts";
 import { videoReviewCli, type FrameFiles } from "./lib/cli.ts";
 import { rpcContract, type FrameIndexDto } from "./lib/contract.ts";
 import { VideoFiles } from "./lib/files.ts";
@@ -106,7 +106,17 @@ export default async function plugin(bb: BbPluginApi) {
   /** A short-lived URL the browser streams the video from (bb's preview server handles ranges). */
   async function mediaUrl(video: VideoRow, refresh = false): Promise<{ url: string; expiresAtMs: number }> {
     const directory = path.dirname(video.absPath);
-    if (isProtectedLocation(video.absPath, protectedOptions) || exposesProtectedLocation(directory, protectedOptions)) {
+    const realFile = await realpath(video.absPath).catch(() => video.absPath);
+    const storedInThread =
+      isInThreadStorage(video.absPath, protectedOptions.dataDir) &&
+      isInThreadStorage(realFile, protectedOptions.dataDir) &&
+      isInThreadStorage(directory, protectedOptions.dataDir, true);
+    if (
+      !storedInThread &&
+      (isProtectedLocation(video.absPath, protectedOptions) ||
+        isProtectedLocation(realFile, protectedOptions) ||
+        exposesProtectedLocation(directory, protectedOptions))
+    ) {
       throw new Error("Videos in your home folder itself or in protected folders are not served; move it into a project folder.");
     }
     const hostId = (await files.localHostId()) ?? undefined;

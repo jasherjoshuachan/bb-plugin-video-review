@@ -54,3 +54,18 @@ test("a frame of the file on disk now, cached by sha and frame", async () => {
   assert.equal(first.frame, 10);
   assert.equal((await media.currentFrame(video, 1e6)).frame, 49, "clamped to the last frame");
 });
+
+test("thread storage is served; the rest of bb's data folder is not", async () => {
+  const { isInThreadStorage, isProtectedLocation } = await import("../lib/authorize.ts");
+  const dataDir = "/home/u/.bb";
+  const file = "/home/u/.bb/thread-storage/thr_abc/out/v6.mp4";
+  assert.equal(isInThreadStorage(file, dataDir), true);
+  assert.equal(isInThreadStorage("/home/u/.bb/thread-storage/thr_abc", dataDir, true), true, "thread folder as preview root");
+  assert.equal(isInThreadStorage("/home/u/.bb/thread-storage", dataDir, true), false, "never all threads at once");
+  assert.equal(isInThreadStorage("/home/u/.bb/thread-storage/thr_abc", dataDir), false, "the folder is not a file");
+  assert.equal(isInThreadStorage("/home/u/.bb/thread-storage/thr_abc/.secret/v.mp4", dataDir), false, "hidden segments");
+  assert.equal(isInThreadStorage("/home/u/.bb/plugins/x/data.db", dataDir), false);
+  assert.equal(isInThreadStorage("/home/u/.bb/thread-storage/../plugins/v.mp4", dataDir), false);
+  assert.equal(isInThreadStorage(file, null), false);
+  assert.equal(isProtectedLocation(file, { home: "/home/u", dataDir, dropsDir: null }), true, "still protected by default");
+});

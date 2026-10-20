@@ -73,6 +73,23 @@ export function isProtectedLocation(absPath: string, options: ProtectedOptions):
 }
 
 /**
+ * True when `target` sits inside one thread's folder of bb's thread storage
+ * (`<dataDir>/thread-storage/<thread>/...`), with no hidden segments. bb opens
+ * thread-storage files in panel tabs, so they are the second exception inside
+ * bb's data folder. A preview of such a folder exposes only that thread's own
+ * files. `allowThreadRoot` accepts the thread folder itself (for a preview root).
+ */
+export function isInThreadStorage(target: string, dataDir: string | null, allowThreadRoot = false): boolean {
+  if (dataDir === null) return false;
+  const root = path.join(path.resolve(dataDir), "thread-storage");
+  const resolved = path.resolve(target);
+  if (!isStrictlyInside(root, resolved)) return false;
+  const segments = path.relative(root, resolved).split(path.sep);
+  if (segments.some((segment) => segment === "" || segment.startsWith(".") || segment === "..")) return false;
+  return allowThreadRoot ? segments.length >= 1 : segments.length >= 2;
+}
+
+/**
  * True when a preview of `directory` would expose a protected location
  * because it contains one: the home folder itself, any folder above it, or a
  * folder above `~/.ssh`, bb's data folder and the rest. bb's previews cover a
