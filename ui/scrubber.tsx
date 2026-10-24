@@ -94,6 +94,36 @@ export function Scrubber(props: Props) {
   const strip = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef(view);
   viewRef.current = view;
+  // One playhead move per screen frame, however fast the pointer reports.
+  const queued = useRef<number | null>(null);
+  const raf = useRef(0);
+  const onScrubRef = useRef(props.onScrub);
+  onScrubRef.current = props.onScrub;
+  const scrub = (n: number) => {
+    queued.current = n;
+    if (raf.current) return;
+    raf.current = requestAnimationFrame(() => {
+      raf.current = 0;
+      if (queued.current !== null) onScrubRef.current(queued.current);
+      queued.current = null;
+    });
+  };
+  useEffect(() => () => cancelAnimationFrame(raf.current), []);
+  // Where the cursor last came to rest on the strip (or was clicked). Leaving the strip puts the playhead back there, so a quick
+  // pass on the way to a button or the picture never moves it; resting 250 ms anywhere keeps that frame.
+  const rest = useRef<number | null>(null);
+  const restTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSkim = useRef<number | null>(null);
+  const REST_MS = 250;
+  const markRest = (n: number) => {
+    if (restTimer.current) clearTimeout(restTimer.current);
+    restTimer.current = setTimeout(() => {
+      rest.current = n;
+    }, REST_MS);
+  };
+  useEffect(() => () => {
+    if (restTimer.current) clearTimeout(restTimer.current);
+  }, []);
 
   useEffect(() => setView(fit(total)), [total, index.sha256]);
   // The window keeps the playhead on screen (playback, frame steps, cuts), as CapCut's timeline does.
@@ -166,97 +196,10 @@ export function Scrubber(props: Props) {
   const scene = assets ? spanAt(assets.scenes, frame) : null;
   const section = assets ? spanAt(assets.sections, frame) : null;
   const slider = sliderOf(view.end - view.start, total);
-
-  return (
-    <div className="shrink-0 select-none border-t border-border bg-[#141414] text-[11px] text-neutral-300">
-      <div className="flex h-7 items-center gap-2 px-2">
-        <span className="tabular-nums text-white">{timecode(index, frame)}</span>
-        <span className="tabular-nums text-neutral-500">f{frame}</span>
-        {section || scene ? (
-          <span className="min-w-0 truncate text-neutral-400">
-            {section?.id}
-            {scene ? ` · ${scene.id}` : ""}
-          </span>
-        ) : null}
-        <span className="flex-1" />
-        {props.assetsError ? <span className="text-red-400">Timeline: {props.assetsError}</span> : null}
-        {!assets && !props.assetsError ? <span className="text-neutral-500">Preparing the filmstrip…</span> : null}
-        <button
-          type="button"
-          className={cn("rounded px-1.5 py-0.5", props.skimming ? "bg-white/15 text-white" : "text-neutral-400 hover:bg-white/10")}
-          title="Skimming: the playhead follows the cursor over the timeline (S)"
-          onClick={props.onToggleSkim}
-        >
-          Skim {props.skimming ? "on" : "off"}
-        </button>
-        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom out" onClick={() => setView((v) => zoom(v, 1 / 1.6, shareAt(v, frame), total))}>
-          −
-        </button>
-        <input
-          type="range"
-          min={0}
-          max={100}
-          value={slider}
-          aria-label="Timeline zoom"
-          className="h-1 w-24 accent-white"
-          onChange={(event) => {
-            const span = spanOf(Number(event.target.value), total);
-            const at = Math.max(0, Math.min(1, shareAt(viewRef.current, frame)));
-            setView(clampView({ start: frame - at * span, end: frame - at * span + span }, total));
-          }}
-        />
-        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom in (Cmd/Ctrl + scroll, or pinch, on the timeline)" onClick={() => setView((v) => zoom(v, 1.6, shareAt(v, frame), total))}>
-          +
-        </button>
-        <button type="button" className={cn("rounded px-1.5 py-0.5", zoomed ? "hover:bg-white/10" : "opacity-40")} title="Fit the whole video" onClick={() => setView(fit(total))}>
-          Fit
-        </button>
-      </div>
-      <div
-        ref={strip}
-        className="relative cursor-pointer"
-        style={{ height: RULER_H + BANDS_H + STRIP_H + 4 }}
-        role="slider"
-        aria-label="Timeline"
-        aria-valuemin={0}
-        aria-valuemax={last}
-        aria-valuenow={frame}
-        onPointerMove={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          setHoverX(event.clientX - rect.left);
-          const d = drag.current;
-          if (d?.mode === "pan") {
-            const share = (d.x - event.clientX) / Math.max(1, rect.width);
-            const span = d.start.end - d.start.start;
-            setView(clampView({ start: d.start.start + share * span, end: d.start.end + share * span }, total));
-            return;
-          }
-          if (d?.mode === "scrub" || props.skimming) props.onScrub(frameAt(event.clientX));
-        }}
-        onPointerLeave={() => {
-          if (!drag.current) setHoverX(null);
-        }}
-        onPointerDown={(event) => {
-          if (event.button === 1 || (event.button === 0 && event.altKey)) {
-            // middle button or Alt + drag pans the zoomed timeline
-            event.currentTarget.setPointerCapture(event.pointerId);
-            drag.current = { mode: "pan", x: event.clientX, start: viewRef.current };
-            return;
-          }
-          if (event.button !== 0) return;
-          event.currentTarget.setPointerCapture(event.pointerId);
-          drag.current = { mode: "scrub", x: event.clientX, start: viewRef.current };
-          props.onScrub(frameAt(event.clientX));
-        }}
-        onPointerUp={(event) => {
-          const d = drag.current;
-          drag.current = null;
-          if (d?.mode === "scrub") props.onScrub(frameAt(event.clientX));
-        }}
-        onPointerCancel={() => {
-          drag.current = null;
-        }}
-      >
+  // The ruler, bands, filmstrip and markers rebuild only when the zoom, the size or the data change, never per frame.
+  const layers = useMemo(
+    () => (
+      <>
         {/* Ruler with time labels. */}
         <div className="absolute inset-x-0 top-0 overflow-hidden border-b border-white/10" style={{ height: RULER_H }}>
           {ruler.map(({ f, major }) => (
@@ -347,6 +290,124 @@ export function Scrubber(props: Props) {
             onClick={() => props.onSelectNote(note)}
           />
         ))}
+      </>
+    ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [view, width, assets, slots, ruler, props.notes, props.mappedMarks, props.activeId, props.inPoint, props.outPoint, fpsValue],
+  );
+
+  return (
+    <div className="shrink-0 select-none border-t border-border bg-[#141414] text-[11px] text-neutral-300">
+      <div className="flex h-7 items-center gap-2 px-2">
+        <span className="tabular-nums text-white">{timecode(index, frame)}</span>
+        <span className="tabular-nums text-neutral-500">f{frame}</span>
+        {section || scene ? (
+          <span className="min-w-0 truncate text-neutral-400">
+            {section?.id}
+            {scene ? ` · ${scene.id}` : ""}
+          </span>
+        ) : null}
+        <span className="flex-1" />
+        {props.assetsError ? <span className="text-red-400">Timeline: {props.assetsError}</span> : null}
+        {!assets && !props.assetsError ? <span className="text-neutral-500">Preparing the filmstrip…</span> : null}
+        <button
+          type="button"
+          className={cn("rounded px-1.5 py-0.5", props.skimming ? "bg-white/15 text-white" : "text-neutral-400 hover:bg-white/10")}
+          title="Skimming: the playhead follows the cursor over the timeline (S)"
+          onClick={props.onToggleSkim}
+        >
+          Skim {props.skimming ? "on" : "off"}
+        </button>
+        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom out" onClick={() => setView((v) => zoom(v, 1 / 1.6, shareAt(v, frame), total))}>
+          −
+        </button>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          value={slider}
+          aria-label="Timeline zoom"
+          className="h-1 w-24 accent-white"
+          onChange={(event) => {
+            const span = spanOf(Number(event.target.value), total);
+            const at = Math.max(0, Math.min(1, shareAt(viewRef.current, frame)));
+            setView(clampView({ start: frame - at * span, end: frame - at * span + span }, total));
+          }}
+        />
+        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom in (Cmd/Ctrl + scroll, or pinch, on the timeline)" onClick={() => setView((v) => zoom(v, 1.6, shareAt(v, frame), total))}>
+          +
+        </button>
+        <button type="button" className={cn("rounded px-1.5 py-0.5", zoomed ? "hover:bg-white/10" : "opacity-40")} title="Fit the whole video" onClick={() => setView(fit(total))}>
+          Fit
+        </button>
+      </div>
+      <div
+        ref={strip}
+        className="relative cursor-pointer"
+        style={{ height: RULER_H + BANDS_H + STRIP_H + 4 }}
+        role="slider"
+        aria-label="Timeline"
+        aria-valuemin={0}
+        aria-valuemax={last}
+        aria-valuenow={frame}
+        onPointerMove={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          setHoverX(event.clientX - rect.left);
+          const d = drag.current;
+          if (d?.mode === "pan") {
+            const share = (d.x - event.clientX) / Math.max(1, rect.width);
+            const span = d.start.end - d.start.start;
+            setView(clampView({ start: d.start.start + share * span, end: d.start.end + share * span }, total));
+            return;
+          }
+          if (d?.mode === "scrub" || props.skimming) {
+            const n = frameAt(event.clientX);
+            if (rest.current === null) rest.current = frame;
+            lastSkim.current = n;
+            markRest(n);
+            scrub(n);
+          }
+        }}
+        onPointerLeave={() => {
+          if (drag.current) return;
+          setHoverX(null);
+          if (restTimer.current) clearTimeout(restTimer.current);
+          const back = rest.current;
+          rest.current = null;
+          if (props.skimming && back !== null && back !== lastSkim.current) scrub(back);
+          lastSkim.current = null;
+        }}
+        onPointerDown={(event) => {
+          if (event.button === 1 || (event.button === 0 && event.altKey)) {
+            // middle button or Alt + drag pans the zoomed timeline
+            event.currentTarget.setPointerCapture(event.pointerId);
+            drag.current = { mode: "pan", x: event.clientX, start: viewRef.current };
+            return;
+          }
+          if (event.button !== 0) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          drag.current = { mode: "scrub", x: event.clientX, start: viewRef.current };
+          const n = frameAt(event.clientX);
+          rest.current = n;
+          lastSkim.current = n;
+          props.onScrub(n);
+        }}
+        onPointerUp={(event) => {
+          const d = drag.current;
+          drag.current = null;
+          if (d?.mode === "scrub") {
+            const n = frameAt(event.clientX);
+            rest.current = n;               // a click or drag always keeps its frame
+            lastSkim.current = n;
+            if (restTimer.current) clearTimeout(restTimer.current);
+            props.onScrub(n);
+          }
+        }}
+        onPointerCancel={() => {
+          drag.current = null;
+        }}
+      >
+        {layers}
         {/* With skimming off, a faint line shows where a click would put the playhead. */}
         {!props.skimming && hoverX !== null ? <div className="pointer-events-none absolute inset-y-0 w-px bg-white/40" style={{ left: hoverX }} /> : null}
         {/* The playhead: a white line with a head on the ruler. */}

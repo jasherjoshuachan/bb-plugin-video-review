@@ -24,7 +24,7 @@ import {
 } from "./hooks";
 import { NoteEditor, NotesList, type EditorValue, type NoteActions } from "./notes-panel";
 import { Player, type CompareView, type PlayerHandle, type Tool } from "./player";
-import type { ScrubAssets } from "./scrubber";
+import { Scrubber, type ScrubAssets } from "./scrubber";
 import { cutsOf, nextCut } from "../lib/scrub-math";
 
 /** Below this tab width the notes go under the player. */
@@ -35,7 +35,7 @@ const KEYS: [string, string][] = [
   ["← / →", "One frame back or forward"],
   ["Shift + ← / →", "One second back or forward"],
   ["↑ / ↓", "Previous / next scene cut (from the render manifest)"],
-  ["Hover the timeline", "Skim: the playhead follows the cursor and stays where you leave it"],
+  ["Hover the timeline", "Skim: the playhead follows the cursor; it keeps the frame where the cursor rested (a quick pass does not move it)"],
   ["S", "Skimming on or off (off: only a click or drag moves the playhead)"],
   ["Cmd/Ctrl + scroll, or pinch", "Zoom the timeline around the cursor"],
   ["Scroll on the timeline", "Move along it when zoomed in (Alt + drag too)"],
@@ -222,6 +222,16 @@ function Review({
       return mapping && !mapping.unmappable ? mapping.frameIn : null;
     },
     [index.sha256, mappings],
+  );
+
+  const notesHere = useMemo(() => notes.filter((note) => note.mediaSha256 === index.sha256), [notes, index.sha256]);
+  const marksHere = useMemo(
+    () =>
+      notes
+        .filter((note) => note.mediaSha256 !== index.sha256 && note.status !== "verified" && note.status !== "wontfix")
+        .map((note) => ({ note, frame: frameHere(note) }))
+        .filter((item): item is { note: Note; frame: number } => item.frame !== null),
+    [notes, index.sha256, frameHere],
   );
 
   const selectNote = useCallback(
@@ -672,6 +682,16 @@ function Review({
       ref={root}
       tabIndex={0}
       onKeyDown={onKeyDown}
+      onPointerDownCapture={(event) => {
+        // A click on the picture, the timeline or a button must not take the keys away from the tab (B, A, M, arrows): focus
+        // returns to the tab unless the click went into a field.
+        if ((event.target as HTMLElement).closest("input, textarea, select, [contenteditable=true]")) return;
+        requestAnimationFrame(() => {
+          const now = document.activeElement;
+          if (!root.current || (now && now !== document.body && root.current.contains(now) && now.closest("input, textarea, select, [contenteditable=true]"))) return;
+          root.current.focus({ preventScroll: true });
+        });
+      }}
       className="relative flex h-full min-h-0 flex-col bg-background outline-none"
       aria-label={`Video review: ${video.name}`}
     >
@@ -782,11 +802,8 @@ function Review({
             ref={player}
             url={media.url}
             index={index}
-            notes={notes.filter((note) => note.mediaSha256 === index.sha256)}
-            mappedMarks={notes
-              .filter((note) => note.mediaSha256 !== index.sha256 && note.status !== "verified" && note.status !== "wontfix")
-              .map((note) => ({ note, frame: frameHere(note) }))
-              .filter((item): item is { note: Note; frame: number } => item.frame !== null)}
+            notes={notesHere}
+            mappedMarks={marksHere}
             compare={compareView}
             activeId={activeId}
             frame={frame}
@@ -873,6 +890,22 @@ function Review({
               <Icon name="MessageSquare" className="size-4" /> Note (M)
             </Button>
           </div>
+          {/* The timeline sits last, under the controls (as in CapCut), so reaching a control never crosses it and moves the playhead. */}
+          <Scrubber
+            index={index}
+            frame={frame}
+            assets={scrub}
+            assetsError={scrubError}
+            skimming={skimming}
+            onToggleSkim={() => setSkimming((value) => !value)}
+            onScrub={(n) => player.current?.scrubTo(n)}
+            notes={notesHere}
+            mappedMarks={marksHere}
+            activeId={activeId}
+            onSelectNote={selectNote}
+            inPoint={inPoint}
+            outPoint={outPoint}
+          />
         </div>
         {notesPanel}
       </div>

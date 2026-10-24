@@ -14,7 +14,7 @@ import {
 import { frameAtTime, seekTimeForFrame } from "../lib/frame-math";
 import type { FrameIndexDto } from "../lib/contract";
 import type { Note, Shape } from "../lib/types";
-import { Scrubber, type ScrubAssets } from "./scrubber";
+import type { ScrubAssets } from "./scrubber";
 
 export type Tool = "none" | "box" | "arrow";
 
@@ -49,6 +49,8 @@ export interface PlayerHandle {
   rate(): number;
   /** The frame under the cursor on the scrubber, or null. */
   skimFrame(): number | null;
+  /** Moves the playhead from the timeline: the proxy shows the frame at once, the full render follows when the cursor rests. */
+  scrubTo(frame: number): void;
 }
 
 interface Props {
@@ -312,8 +314,9 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
       skimFrame() {
         return skimRef.current;
       },
+      scrubTo,
     }),
-    [seek, frame],
+    [seek, frame, scrubTo],
   );
 
   // Follow every presented frame; loop the in/out range when asked.
@@ -525,21 +528,6 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
         </div>
       ) : null}
       </div>
-      <Scrubber
-        index={index}
-        frame={frame}
-        assets={props.scrub}
-        assetsError={props.scrubError}
-        skimming={props.skimming}
-        onToggleSkim={props.onToggleSkim}
-        onScrub={scrubTo}
-        notes={props.notes}
-        mappedMarks={props.mappedMarks}
-        activeId={props.activeId}
-        onSelectNote={props.onSelectNote}
-        inPoint={inPoint}
-        outPoint={outPoint}
-      />
     </div>
   );
 });
