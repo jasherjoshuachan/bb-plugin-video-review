@@ -31,6 +31,8 @@ interface Props {
   assets: ScrubAssets | null;
   assetsError: string | null;
   skimming: boolean;
+  /** Skimming is on but held while a box or arrow is being drawn or a note is being written, so the picture stays under the marks. */
+  skimPaused?: boolean;
   onToggleSkim: () => void;
   /** Moves the playhead (and the picture) to a frame. */
   onScrub: (frame: number) => void;
@@ -316,7 +318,7 @@ export function Scrubber(props: Props) {
           title="Skimming: the playhead follows the cursor over the timeline (S)"
           onClick={props.onToggleSkim}
         >
-          Skim {props.skimming ? "on" : "off"}
+          {props.skimPaused ? "Skim paused (noting)" : `Skim ${props.skimming ? "on" : "off"}`}
         </button>
         <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom out" onClick={() => setView((v) => zoom(v, 1 / 1.6, shareAt(v, frame), total))}>
           −

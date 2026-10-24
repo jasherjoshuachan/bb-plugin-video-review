@@ -896,7 +896,8 @@ function Review({
             frame={frame}
             assets={scrub}
             assetsError={scrubError}
-            skimming={skimming}
+            skimming={skimming && tool === "none" && !pending}
+            skimPaused={skimming && (tool !== "none" || Boolean(pending))}
             onToggleSkim={() => setSkimming((value) => !value)}
             onScrub={(n) => player.current?.scrubTo(n)}
             notes={notesHere}
