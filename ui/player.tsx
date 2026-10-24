@@ -14,6 +14,7 @@ import {
 import { frameAtTime, seekTimeForFrame } from "../lib/frame-math";
 import type { FrameIndexDto } from "../lib/contract";
 import type { Note, Shape } from "../lib/types";
+import { Scrubber, type ScrubAssets } from "./scrubber";
 
 export type Tool = "none" | "box" | "arrow";
 
@@ -46,6 +47,8 @@ export interface PlayerHandle {
   pause(): void;
   isPlaying(): boolean;
   rate(): number;
+  /** The frame under the cursor on the scrubber, or null. */
+  skimFrame(): number | null;
 }
 
 interface Props {
@@ -70,6 +73,11 @@ interface Props {
   /** Notes from other versions, marked at the frame they map to here (dimmed). */
   mappedMarks?: { note: Note; frame: number }[];
   compare?: CompareView | null;
+  /** The scrubber's files (null while they are built) and its state. */
+  scrub: ScrubAssets | null;
+  scrubError: string | null;
+  skimming: boolean;
+  onToggleSkim: () => void;
 }
 
 /** The other version, kept on the frame that matches the main player. */
@@ -203,6 +211,23 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
   const loopRef = useRef({ loop, inPoint, outPoint });
   loopRef.current = { loop, inPoint, outPoint };
   const last = index.pts.length - 1;
+  const [skim, setSkim] = useState<number | null>(null);
+  const skimRef = useRef<number | null>(null);
+  skimRef.current = skim;
+  const proxyRef = useRef<HTMLVideoElement | null>(null);
+
+  // The skimmed frame on the proxy (a keyframe every 5 frames, so each seek lands at once); the full render stays on the playhead.
+  // One seek at a time: while the proxy is seeking, the newest skim frame waits and goes next (no backlog while the cursor flies).
+  const skimTime = (n: number) => (index.pts[n] ?? 0) - index.formatStart + 0.5 / Math.max(1, index.fps.num / index.fps.den || 25);
+  const applySkim = useCallback(() => {
+    const proxy = proxyRef.current;
+    const n = skimRef.current;
+    if (!proxy || n === null || proxy.readyState < 1 || proxy.seeking) return;
+    const t = skimTime(n);
+    if (Math.abs(proxy.currentTime - t) > 0.001) proxy.currentTime = t;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [index]);
+  useEffect(() => applySkim(), [skim, applySkim]);
 
   const seek = useCallback(
     (n: number) => {
@@ -244,6 +269,9 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
       },
       rate() {
         return videoRef.current?.playbackRate ?? 1;
+      },
+      skimFrame() {
+        return skimRef.current;
       },
     }),
     [seek, frame],
@@ -306,7 +334,6 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
         ? [{ type: "arrow", x1: drag.x, y1: drag.y, x2: drag.x2, y2: drag.y2 }]
         : [];
 
-  const pct = (n: number) => `${(n / Math.max(1, last)) * 100}%`;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -336,6 +363,22 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
           onRateChange={(event) => setRateNow(event.currentTarget.playbackRate)}
           onError={props.onMediaError}
         />
+        {props.scrub ? (
+          <video
+            ref={proxyRef}
+            src={props.scrub.proxyUrl}
+            preload="auto"
+            muted
+            playsInline
+            className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+            style={{ visibility: skim !== null ? "visible" : "hidden" }}
+            onLoadedMetadata={applySkim}
+            onSeeked={applySkim}
+          />
+        ) : null}
+        {skim !== null ? (
+          <span className="pointer-events-none absolute right-2 top-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white">Skimming · frame {skim}</span>
+        ) : null}
         {compare && !side ? (
           <CompareVideo
             view={compare}
@@ -429,56 +472,22 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
         </div>
       ) : null}
       </div>
-      <div
-        className="relative h-6 shrink-0 cursor-pointer border-t border-border bg-muted/40"
-        role="slider"
-        aria-label="Timeline"
-        aria-valuemin={0}
-        aria-valuemax={last}
-        aria-valuenow={frame}
-        onPointerDown={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          seek(((event.clientX - rect.left) / rect.width) * last);
-        }}
-      >
-        {inPoint !== null ? (
-          <div
-            className="absolute inset-y-0 bg-primary/20"
-            style={{ left: pct(inPoint), width: outPoint !== null && outPoint >= inPoint ? `calc(${pct(outPoint)} - ${pct(inPoint)})` : "2px" }}
-          />
-        ) : null}
-        {props.notes
-          .filter((note) => note.frameIn !== null)
-          .map((note) => (
-            <button
-              key={note.id}
-              type="button"
-              title={`#${note.seq} ${note.text}`}
-              aria-label={`Note ${note.seq}`}
-              className={`absolute top-0.5 h-4 w-1.5 -translate-x-1/2 rounded-sm ${
-                note.id === props.activeId ? "bg-primary" : "bg-foreground/60 hover:bg-foreground"
-              }`}
-              style={{ left: pct(note.frameIn!) }}
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={() => props.onSelectNote(note)}
-            />
-          ))}
-        {(props.mappedMarks ?? []).map(({ note, frame: at }) => (
-          <button
-            key={`m-${note.id}`}
-            type="button"
-            title={`#${note.seq} from ${note.versionLabel}: ${note.text}`}
-            aria-label={`Note ${note.seq} from ${note.versionLabel}`}
-            className={`absolute top-1 h-3 w-1.5 -translate-x-1/2 rounded-sm border border-dashed ${
-              note.id === props.activeId ? "border-primary bg-primary/40" : "border-foreground/60 bg-transparent hover:bg-foreground/40"
-            }`}
-            style={{ left: pct(at) }}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={() => props.onSelectNote(note)}
-          />
-        ))}
-        <div className="pointer-events-none absolute inset-y-0 w-0.5 bg-red-500" style={{ left: pct(frame) }} />
-      </div>
+      <Scrubber
+        index={index}
+        frame={frame}
+        assets={props.scrub}
+        assetsError={props.scrubError}
+        skimming={props.skimming}
+        onToggleSkim={props.onToggleSkim}
+        onSkim={setSkim}
+        onSeek={seek}
+        notes={props.notes}
+        mappedMarks={props.mappedMarks}
+        activeId={props.activeId}
+        onSelectNote={props.onSelectNote}
+        inPoint={inPoint}
+        outPoint={outPoint}
+      />
     </div>
   );
 });

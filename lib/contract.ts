@@ -232,6 +232,28 @@ export const rpcContract = defineRpcContract({
       urls: z.object({ a: z.string(), b: z.string(), difference: z.string() }),
     }),
   },
+  /**
+   * The scrubber's files for one version (thumbnail sheets, black runs, a fast-seek proxy) and its section and scene
+   * bands in frames. Built on first use (about a minute for a long render), then cached by sha256.
+   */
+  "scrub.assets": {
+    input: z.object({ videoId: z.string(), sha256: z.string() }).strict(),
+    output: z.object({
+      proxyUrl: z.string(),
+      sheetUrls: z.array(z.string()),
+      step: z.number(),
+      count: z.number(),
+      cols: z.number(),
+      rows: z.number(),
+      w: z.number(),
+      h: z.number(),
+      /** Black runs as frames of this version, [first, last]. */
+      black: z.array(z.tuple([z.number(), z.number()])),
+      sections: z.array(z.object({ id: z.string(), start: z.number(), end: z.number() })),
+      scenes: z.array(z.object({ id: z.string(), kind: z.string().optional(), start: z.number(), end: z.number() })),
+      expiresAtMs: z.number(),
+    }),
+  },
   /** Cheap check for a re-render: the sha of the file on disk now. */
   "video.state": {
     input: z.object({ videoId: z.string() }).strict(),

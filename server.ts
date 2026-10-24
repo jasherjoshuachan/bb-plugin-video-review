@@ -19,9 +19,10 @@ import { exposesProtectedLocation, isInThreadStorage, isProtectedLocation, type 
 import { videoReviewCli, type CompareResult, type FrameFiles } from "./lib/cli.ts";
 import { CrossVersion } from "./lib/crossversion.ts";
 import { parseTimeline } from "./lib/timeline.ts";
+import { buildScrub, type ScrubMeta } from "./lib/scrub.ts";
 import { rpcContract, type FrameIndexDto } from "./lib/contract.ts";
 import { joinPath, VideoFiles, type OpenerSource } from "./lib/files.ts";
-import { frameLabel, type FrameIndex } from "./lib/frames.ts";
+import { frameAtTime, frameDuration, frameLabel, type FrameIndex } from "./lib/frames.ts";
 import { dataDirFromDatabaseName, joinPreviewUrl } from "./lib/inside.ts";
 import { findTools, VideoMedia } from "./lib/media.ts";
 import { buildHandoffMessage } from "./lib/message.ts";
@@ -123,6 +124,29 @@ export default async function plugin(bb: BbPluginApi) {
       .keep(video, version)
       .then(() => publish([video.id]))
       .catch((error: unknown) => bb.log.warn(`keep ${version.label}: ${String(error)}`));
+  }
+
+  /** Scrubber files per version, built once; concurrent tabs share one build. */
+  const scrubBuilds = new Map<string, Promise<ScrubMeta>>();
+  function scrubFor(file: string, index: FrameIndex): Promise<ScrubMeta> {
+    let pending = scrubBuilds.get(index.sha256);
+    if (!pending) {
+      const duration = (index.pts[index.pts.length - 1] ?? 0) - index.formatStart + frameDuration(index);
+      pending = settings
+        .get()
+        .then((values) => findTools(values))
+        .then((tools) =>
+          buildScrub(tools, file, path.join(dataDir, "scrub", index.sha256.slice(0, 32)), {
+            sha256: index.sha256,
+            duration,
+            width: index.width,
+            height: index.height,
+          }),
+        );
+      scrubBuilds.set(index.sha256, pending);
+      pending.catch(() => scrubBuilds.delete(index.sha256));
+    }
+    return pending;
   }
 
   function requireVideo(videoId: string): VideoRow {
@@ -343,6 +367,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const video = store.upsertVideo(null, absPath);
       const { index, version } = await currentVersion(video);
+      void scrubFor(absPath, index).catch((error: unknown) => bb.log.warn(`scrubber for ${version.label}: ${String(error)}`));   // ready by the time the tab asks
       return { video: toReviewVideo(video), version, index: indexDto(index), media: await mediaUrl(video), intent };
     },
 
@@ -356,6 +381,43 @@ export default async function plugin(bb: BbPluginApi) {
       const version = requireVersion(video, sha256);
       const { index } = await cross.indexFor(video, version);
       return { version, index: indexDto(index), media: await versionMediaUrl(video, version) };
+    },
+
+    async "scrub.assets"({ videoId, sha256 }) {
+      const video = requireVideo(videoId);
+      const version = requireVersion(video, sha256);
+      const { index, file } = await cross.indexFor(video, version);
+      const meta = await scrubFor(file, index);
+      const dir = path.join(dataDir, "scrub", index.sha256.slice(0, 32));
+      const proxy = await previewUrl(path.join(dir, meta.proxy), false);
+      const sheetUrls = await Promise.all(meta.sheets.map(async (name) => (await previewUrl(path.join(dir, name), false)).url));
+      const toFrame = (t: number) => frameAtTime(index, t + index.formatStart);
+      const raw = store.timelineOf(video.id, version.sha256);
+      let sections: { id: string; start: number; end: number }[] = [];
+      let scenes: { id: string; kind?: string; start: number; end: number }[] = [];
+      if (raw) {
+        try {
+          const timeline = parseTimeline(JSON.parse(raw), index.pts.length);
+          sections = timeline.sections;
+          scenes = timeline.scenes;
+        } catch (error) {
+          bb.log.warn(`timeline of ${version.label}: ${String(error)}`);
+        }
+      }
+      return {
+        proxyUrl: proxy.url,
+        sheetUrls,
+        step: meta.step,
+        count: meta.count,
+        cols: meta.cols,
+        rows: meta.rows,
+        w: meta.w,
+        h: meta.h,
+        black: meta.black.map(([a, b]) => [toFrame(a), Math.max(toFrame(a), toFrame(b) - 1)] as [number, number]),
+        sections,
+        scenes,
+        expiresAtMs: proxy.expiresAtMs,
+      };
     },
 
     async "versions.mediaUrl"({ videoId, sha256, refresh }) {

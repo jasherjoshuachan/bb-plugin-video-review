@@ -24,6 +24,8 @@ import {
 } from "./hooks";
 import { NoteEditor, NotesList, type EditorValue, type NoteActions } from "./notes-panel";
 import { Player, type CompareView, type PlayerHandle, type Tool } from "./player";
+import type { ScrubAssets } from "./scrubber";
+import { cutsOf, nextCut } from "../lib/scrub-math";
 
 /** Below this tab width the notes go under the player. */
 const WIDE_MIN_PX = 760;
@@ -31,14 +33,18 @@ const WIDE_MIN_PX = 760;
 const KEYS: [string, string][] = [
   ["Space / K", "Play or pause"],
   ["← / →", "One frame back or forward"],
-  ["Shift + ← / →", "Ten frames"],
+  ["Shift + ← / →", "One second back or forward"],
+  ["↑ / ↓", "Previous / next scene cut (from the render manifest)"],
+  ["Hover the timeline", "Skim: the picture follows the cursor"],
+  ["S", "Skimming on or off"],
+  ["Scroll / pinch on the timeline", "Zoom around the cursor; sideways scroll pans"],
   ["J", "Back one second"],
   ["L", "Play; press again for 1.5x, 2x"],
   ["I / O", "Set in and out"],
   ["Shift + I / O", "Go to in or out"],
   ["X", "Clear in and out"],
   ["Ctrl + L", "Loop in to out"],
-  ["M or ;", "Note on this frame (or the in–out range)"],
+  ["M or ;", "Note on this frame (while skimming: on the skimmed frame)"],
   ["B / A", "Draw a box / an arrow"],
   [", / .", "Previous / next note"],
   ["F", "Go to frame number"],
@@ -135,6 +141,9 @@ function Review({
   const [other, setOther] = useState<{ version: VideoVersion; index: FrameIndexDto; media: MediaDto } | null>(null);
   const [report, setReport] = useState<{ open: boolean; data: ReportDto | null; error: string | null }>({ open: false, data: null, error: null });
   const [verifying, setVerifying] = useState(false);
+  const [skimming, setSkimming] = useState(true);
+  const [scrub, setScrub] = useState<ScrubAssets | null>(null);
+  const [scrubError, setScrubError] = useState<string | null>(null);
   const pendingIntent = useRef<string | null>(loaded.intent?.compare ?? null);
 
   const versions = useMemo(() => byAge(disk?.versions ?? [version]), [disk?.versions, version]);
@@ -167,22 +176,37 @@ function Review({
     root.current?.focus();
   }, []);
 
+  // The scrubber's files for the version on screen (built once per version on the server, about a minute for a long render).
+  useEffect(() => {
+    let alive = true;
+    setScrub(null);
+    setScrubError(null);
+    rpc.call("scrub.assets", { videoId: video.id, sha256: index.sha256 }).then(
+      (assets) => alive && setScrub(assets),
+      (cause: unknown) => alive && setScrubError(errorText(cause)),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [rpc, video.id, index.sha256]);
+
   const onFrame = useCallback((n: number) => setFrame(n), []);
 
-  const openEditor = useCallback(() => {
+  const openEditor = useCallback((at?: number) => {
     player.current?.pause();
     if (!onDiskFile) {
       const now = versions.find((v) => v.sha256 === diskSha);
       toast.message(`Notes go on the file on disk now${now ? ` (${now.label})` : ""}. Switch to it to add notes.`);
       return;
     }
+    const here = at ?? frame;
     const hasRange = inPoint !== null && outPoint !== null && outPoint > inPoint;
-    const inRange = hasRange && frame >= inPoint! && frame <= outPoint!;
+    const inRange = hasRange && here >= inPoint! && here <= outPoint!;
     // The frame is bound now, when the note starts, not when it is saved.
     setPending({
       note: null,
-      frameIn: inRange ? inPoint! : frame,
-      frameOut: inRange ? outPoint! : frame,
+      frameIn: inRange ? inPoint! : here,
+      frameOut: inRange ? outPoint! : here,
       kinds: inRange ? ["range", "frame", "general"] : ["frame", "general"],
       initial: { kind: inRange ? "range" : "frame", text: "", category: "other" },
     });
@@ -373,7 +397,16 @@ function Review({
       player.current?.toggle();
     } else if (key === "ArrowLeft" || key === "ArrowRight") {
       handled();
-      player.current?.step((key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 10 : 1));
+      player.current?.step((key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? Math.max(1, Math.round(index.fps.num / index.fps.den)) : 1));
+    } else if ((key === "ArrowUp" || key === "ArrowDown") && !event.metaKey && !event.ctrlKey) {
+      handled();
+      const cuts = cutsOf([...(scrub?.scenes ?? []), ...(scrub?.sections ?? [])]);
+      const to = nextCut(cuts, frame, key === "ArrowDown" ? 1 : -1);
+      if (to !== null) player.current?.seek(to);
+      else if (cuts.length === 0) toast.message("No scene cuts: this version has no render manifest.");
+    } else if ((key === "s" || key === "S") && !event.metaKey && !event.ctrlKey) {
+      handled();
+      setSkimming((value) => !value);
     } else if (key === "j" || key === "J") {
       handled();
       player.current?.seek(frame - Math.round(index.fps.num / index.fps.den));
@@ -409,7 +442,11 @@ function Review({
       setLoop(false);
     } else if (key === "m" || key === "M" || key === ";") {
       handled();
-      openEditor();
+      const skimmed = player.current?.skimFrame() ?? null;
+      if (skimmed !== null) {
+        player.current?.seek(skimmed);
+        openEditor(skimmed);
+      } else openEditor();
     } else if (key === "b" || key === "B") {
       handled();
       player.current?.pause();
@@ -766,6 +803,10 @@ function Review({
             onMediaError={() => void refreshMedia().catch(() => toast.error("The video could not be loaded."))}
             onSelectNote={selectNote}
             onPlayingChange={setPlaying}
+            scrub={scrub}
+            scrubError={scrubError}
+            skimming={skimming}
+            onToggleSkim={() => setSkimming((value) => !value)}
           />
           <div className="flex shrink-0 flex-wrap items-center gap-2 border-t border-border px-3 py-1.5 text-xs">
             <Button size="sm" variant="ghost" className="h-7 px-2" aria-label="One frame back" onClick={() => player.current?.step(-1)}>
@@ -827,7 +868,7 @@ function Review({
                 </button>
               ))}
             </div>
-            <Button size="sm" variant="secondary" className="h-7" onClick={openEditor}>
+            <Button size="sm" variant="secondary" className="h-7" onClick={() => openEditor()}>
               <Icon name="MessageSquare" className="size-4" /> Note (M)
             </Button>
           </div>
