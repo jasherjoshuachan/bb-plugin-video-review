@@ -1,13 +1,14 @@
-// The scrubber strip under the picture (issue get-bb/bb#6039): hover to skim (the picture follows the cursor through a fast-seek
-// proxy), click or drag to move the playhead, a thumbnail filmstrip, section and scene bands from the render manifest, note
-// markers, black-frame marks, and zoom (scroll or pinch around the cursor) and pan (sideways scroll, or drag the bands).
-// Frame stepping, notes and markup stay the player's; this only finds the moment faster.
+// The timeline under the picture, CapCut style (issue get-bb/bb#6039): the frame in the player is always the playhead's.
+// Hovering moves the playhead with the cursor (skimming; S turns it off), click or drag moves it too, and it stays where you leave
+// it. A time ruler with labels, a white playhead with a head, a thumbnail filmstrip, section and scene bands from the render
+// manifest, note markers and black-frame marks. Cmd/Ctrl + scroll (or pinch) zooms around the cursor, plain or sideways scroll
+// moves along, the slider and Fit set the zoom. Frame stepping, notes and markup stay the player's.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { timecode } from "../lib/frame-math";
 import type { FrameIndexDto } from "../lib/contract";
 import type { Note } from "../lib/types";
-import { clampView, fit, follow, frameAtX, pan, shareAt, tileAt, zoom, type View } from "../lib/scrub-math";
+import { clampView, fit, follow, frameAtX, MIN_SPAN, pan, shareAt, tileAt, zoom, type View } from "../lib/scrub-math";
 
 export interface ScrubAssets {
   proxyUrl: string;
@@ -31,9 +32,8 @@ interface Props {
   assetsError: string | null;
   skimming: boolean;
   onToggleSkim: () => void;
-  /** The frame under the cursor (null when the cursor leaves the strip); the player shows it. */
-  onSkim: (frame: number | null) => void;
-  onSeek: (frame: number) => void;
+  /** Moves the playhead (and the picture) to a frame. */
+  onScrub: (frame: number) => void;
   notes: Note[];
   mappedMarks?: { note: Note; frame: number }[];
   activeId: string | null;
@@ -42,6 +42,8 @@ interface Props {
   outPoint: number | null;
 }
 
+const RULER_H = 18;
+const BANDS_H = 12;
 const STRIP_H = 48;
 
 function spanAt<T extends { start: number; end: number }>(list: T[], frame: number): T | null {
@@ -62,6 +64,24 @@ function thumb(assets: ScrubAssets, t: number, height: number): React.CSSPropert
   };
 }
 
+/** Ruler label: mm:ss on whole seconds, frames ("10f") inside a second. */
+function rulerLabel(frame: number, fps: number): string {
+  const base = Math.max(1, Math.round(fps));
+  const s = Math.floor(frame / base);
+  const f = frame % base;
+  return f === 0 ? `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}` : `${f}f`;
+}
+
+/** The slider's 0-100 against the visible span: 0 is the whole video, 100 the closest zoom. */
+function sliderOf(span: number, total: number): number {
+  const hi = Math.log(Math.max(total, MIN_SPAN + 1)), lo = Math.log(Math.min(MIN_SPAN, total));
+  return hi === lo ? 0 : Math.round(((hi - Math.log(span)) / (hi - lo)) * 100);
+}
+function spanOf(value: number, total: number): number {
+  const hi = Math.log(Math.max(total, MIN_SPAN + 1)), lo = Math.log(Math.min(MIN_SPAN, total));
+  return Math.exp(hi - (value / 100) * (hi - lo));
+}
+
 export function Scrubber(props: Props) {
   const { index, frame, assets } = props;
   const total = index.pts.length;
@@ -69,13 +89,14 @@ export function Scrubber(props: Props) {
   const fpsValue = index.fps.num / index.fps.den || 25;
   const [view, setView] = useState<View>(() => fit(total));
   const [width, setWidth] = useState(0);
-  const [hover, setHover] = useState<{ frame: number; x: number } | null>(null);
-  const drag = useRef<{ mode: "seek" | "pan"; x: number; start: View; lastSeek: number } | null>(null);
+  const [hoverX, setHoverX] = useState<number | null>(null);
+  const drag = useRef<{ mode: "scrub" | "pan"; x: number; start: View } | null>(null);
   const strip = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef(view);
   viewRef.current = view;
 
   useEffect(() => setView(fit(total)), [total, index.sha256]);
+  // The window keeps the playhead on screen (playback, frame steps, cuts), as CapCut's timeline does.
   useEffect(() => setView((v) => follow(v, frame, total)), [frame, total]);
 
   useEffect(() => {
@@ -84,18 +105,18 @@ export function Scrubber(props: Props) {
     const ro = new ResizeObserver(() => setWidth(el.clientWidth));
     ro.observe(el);
     setWidth(el.clientWidth);
-    // Scroll or pinch zooms around the cursor; sideways scroll (or Shift + scroll) pans. Not passive, so the tab does not scroll.
+    // Cmd/Ctrl + scroll and trackpad pinch (which arrives as ctrl + wheel) zoom around the cursor; plain or sideways scroll moves
+    // along the timeline. Not passive, so the tab itself does not scroll.
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       const rect = el.getBoundingClientRect();
       const at = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
-      const sideways = event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY);
-      if (sideways) {
-        const d = event.shiftKey ? event.deltaY || event.deltaX : event.deltaX;
-        setView((v) => pan(v, d / Math.max(1, rect.width), total));
-      } else {
-        const strength = event.ctrlKey ? 0.02 : 0.004;     // a trackpad pinch arrives as ctrl + wheel with small deltas
+      if (event.ctrlKey || event.metaKey) {
+        const strength = event.ctrlKey && !event.metaKey && Math.abs(event.deltaY) < 10 ? 0.03 : 0.006;
         setView((v) => zoom(v, Math.exp(-event.deltaY * strength), at, total));
+      } else {
+        const d = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+        setView((v) => pan(v, d / Math.max(1, rect.width), total));
       }
     };
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -115,7 +136,6 @@ export function Scrubber(props: Props) {
   const pct = (n: number) => `${shareAt(view, n) * 100}%`;
   const visible = (a: number, b: number) => b >= view.start && a <= view.end;
 
-  // Filmstrip slots: one thumbnail per slot, each showing the frame at the slot's middle.
   const slots = useMemo(() => {
     if (!assets || width <= 0) return [];
     const tileW = (STRIP_H * assets.w) / assets.h;
@@ -128,158 +148,161 @@ export function Scrubber(props: Props) {
     return out;
   }, [assets, width, view, last, index.pts, index.formatStart]);
 
-  // Ruler ticks at a readable interval for the zoom level.
-  const ticks = useMemo(() => {
-    const seconds = (view.end - view.start) / fpsValue;
-    const every = [0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120].find((s) => seconds / s <= Math.max(4, width / 90)) ?? 300;
-    const out: number[] = [];
-    const first = Math.ceil(view.start / fpsValue / every) * every;
-    for (let s = first; s * fpsValue <= view.end; s += every) out.push(Math.round(s * fpsValue));
+  // Ruler: labelled ticks about 90 px apart, small ticks between them.
+  const ruler = useMemo(() => {
+    const span = view.end - view.start;
+    const steps = [1, 2, 5, 10, 25, 50, 125, 250, 500, 750, 1500, 3000, 7500].map((k) => Math.max(1, Math.round((k * fpsValue) / 25)));
+    const major = steps.find((s) => (s / span) * width >= 90) ?? steps[steps.length - 1];
+    const minor = Math.max(1, major / 5);
+    const out: { f: number; major: boolean }[] = [];
+    for (let f = Math.ceil(view.start / minor) * minor; f <= view.end; f += minor) {
+      const r = Math.round(f);
+      out.push({ f: r, major: r % major === 0 });
+    }
     return out;
   }, [view, fpsValue, width]);
 
   const zoomed = view.start > 0 || view.end < total;
-  const hoverScene = hover && assets ? spanAt(assets.scenes, hover.frame) : null;
-  const hoverSection = hover && assets ? spanAt(assets.sections, hover.frame) : null;
+  const scene = assets ? spanAt(assets.scenes, frame) : null;
+  const section = assets ? spanAt(assets.sections, frame) : null;
+  const slider = sliderOf(view.end - view.start, total);
 
   return (
-    <div className="shrink-0 select-none border-t border-border bg-muted/30 text-[11px]">
-      <div className="flex h-6 items-center gap-2 px-2 text-muted-foreground">
-        <span className="tabular-nums">
-          {hover ? `${timecode(index, hover.frame)} · f${hover.frame}` : `${timecode(index, frame)} · f${frame}`}
-        </span>
-        {hover && (hoverSection || hoverScene) ? (
-          <span className="min-w-0 truncate">
-            {hoverSection?.id}
-            {hoverScene ? ` · ${hoverScene.id}` : ""}
+    <div className="shrink-0 select-none border-t border-border bg-[#141414] text-[11px] text-neutral-300">
+      <div className="flex h-7 items-center gap-2 px-2">
+        <span className="tabular-nums text-white">{timecode(index, frame)}</span>
+        <span className="tabular-nums text-neutral-500">f{frame}</span>
+        {section || scene ? (
+          <span className="min-w-0 truncate text-neutral-400">
+            {section?.id}
+            {scene ? ` · ${scene.id}` : ""}
           </span>
         ) : null}
         <span className="flex-1" />
-        {props.assetsError ? <span className="text-destructive">Scrubber: {props.assetsError}</span> : null}
-        {!assets && !props.assetsError ? <span>Preparing the filmstrip…</span> : null}
+        {props.assetsError ? <span className="text-red-400">Timeline: {props.assetsError}</span> : null}
+        {!assets && !props.assetsError ? <span className="text-neutral-500">Preparing the filmstrip…</span> : null}
         <button
           type="button"
-          className={cn("rounded px-1.5 py-0.5", props.skimming ? "bg-primary/15 text-foreground" : "hover:bg-muted")}
-          title="Skim: the picture follows the cursor over the timeline (S)"
+          className={cn("rounded px-1.5 py-0.5", props.skimming ? "bg-white/15 text-white" : "text-neutral-400 hover:bg-white/10")}
+          title="Skimming: the playhead follows the cursor over the timeline (S)"
           onClick={props.onToggleSkim}
         >
           Skim {props.skimming ? "on" : "off"}
         </button>
-        <button type="button" className="rounded px-1.5 py-0.5 hover:bg-muted" title="Zoom out" onClick={() => setView((v) => zoom(v, 1 / 1.6, 0.5, total))}>
+        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom out" onClick={() => setView((v) => zoom(v, 1 / 1.6, shareAt(v, frame), total))}>
           −
         </button>
-        <button type="button" className="rounded px-1.5 py-0.5 hover:bg-muted" title="Zoom in (or scroll / pinch on the strip)" onClick={() => setView((v) => zoom(v, 1.6, shareAt(v, frame), total))}>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          value={slider}
+          aria-label="Timeline zoom"
+          className="h-1 w-24 accent-white"
+          onChange={(event) => {
+            const span = spanOf(Number(event.target.value), total);
+            const at = Math.max(0, Math.min(1, shareAt(viewRef.current, frame)));
+            setView(clampView({ start: frame - at * span, end: frame - at * span + span }, total));
+          }}
+        />
+        <button type="button" className="rounded px-1.5 hover:bg-white/10" title="Zoom in (Cmd/Ctrl + scroll, or pinch, on the timeline)" onClick={() => setView((v) => zoom(v, 1.6, shareAt(v, frame), total))}>
           +
         </button>
-        <button
-          type="button"
-          className={cn("rounded px-1.5 py-0.5", zoomed ? "hover:bg-muted" : "opacity-40")}
-          title="Fit the whole video"
-          onClick={() => setView(fit(total))}
-        >
+        <button type="button" className={cn("rounded px-1.5 py-0.5", zoomed ? "hover:bg-white/10" : "opacity-40")} title="Fit the whole video" onClick={() => setView(fit(total))}>
           Fit
         </button>
       </div>
       <div
         ref={strip}
         className="relative cursor-pointer"
-        style={{ height: 14 + 10 + STRIP_H }}
+        style={{ height: RULER_H + BANDS_H + STRIP_H + 4 }}
         role="slider"
         aria-label="Timeline"
         aria-valuemin={0}
         aria-valuemax={last}
         aria-valuenow={frame}
         onPointerMove={(event) => {
-          const f = frameAt(event.clientX);
           const rect = event.currentTarget.getBoundingClientRect();
-          setHover({ frame: f, x: event.clientX - rect.left });
+          setHoverX(event.clientX - rect.left);
           const d = drag.current;
           if (d?.mode === "pan") {
             const share = (d.x - event.clientX) / Math.max(1, rect.width);
-            setView(clampView({ start: d.start.start + share * (d.start.end - d.start.start), end: d.start.end + share * (d.start.end - d.start.start) }, total));
+            const span = d.start.end - d.start.start;
+            setView(clampView({ start: d.start.start + share * span, end: d.start.end + share * span }, total));
             return;
           }
-          if (d?.mode === "seek") {
-            props.onSkim(f);
-            const now = performance.now();
-            if (now - d.lastSeek > 120) {
-              d.lastSeek = now;
-              props.onSeek(f);
-            }
-            return;
-          }
-          if (props.skimming) props.onSkim(f);
+          if (d?.mode === "scrub" || props.skimming) props.onScrub(frameAt(event.clientX));
         }}
         onPointerLeave={() => {
-          if (drag.current) return;
-          setHover(null);
-          props.onSkim(null);
+          if (!drag.current) setHoverX(null);
         }}
         onPointerDown={(event) => {
-          event.currentTarget.setPointerCapture(event.pointerId);
-          const rect = event.currentTarget.getBoundingClientRect();
-          const onBands = event.clientY - rect.top < 24;
-          if (onBands && zoomed) {
-            drag.current = { mode: "pan", x: event.clientX, start: viewRef.current, lastSeek: 0 };
+          if (event.button === 1 || (event.button === 0 && event.altKey)) {
+            // middle button or Alt + drag pans the zoomed timeline
+            event.currentTarget.setPointerCapture(event.pointerId);
+            drag.current = { mode: "pan", x: event.clientX, start: viewRef.current };
             return;
           }
-          const f = frameAt(event.clientX);
-          drag.current = { mode: "seek", x: event.clientX, start: viewRef.current, lastSeek: performance.now() };
-          props.onSeek(f);
-          props.onSkim(f);
+          if (event.button !== 0) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          drag.current = { mode: "scrub", x: event.clientX, start: viewRef.current };
+          props.onScrub(frameAt(event.clientX));
         }}
         onPointerUp={(event) => {
           const d = drag.current;
           drag.current = null;
-          if (d?.mode === "seek") props.onSeek(frameAt(event.clientX));
-          props.onSkim(null);
+          if (d?.mode === "scrub") props.onScrub(frameAt(event.clientX));
         }}
         onPointerCancel={() => {
           drag.current = null;
-          props.onSkim(null);
         }}
       >
-        {/* Sections, then scenes, from the render manifest. */}
-        <div className="absolute inset-x-0 top-0 h-3.5 overflow-hidden">
+        {/* Ruler with time labels. */}
+        <div className="absolute inset-x-0 top-0 overflow-hidden border-b border-white/10" style={{ height: RULER_H }}>
+          {ruler.map(({ f, major }) => (
+            <div key={f} className="absolute bottom-0" style={{ left: pct(f) }}>
+              <div className={cn("w-px", major ? "h-2 bg-neutral-400" : "h-1 bg-neutral-600")} />
+              {major ? (
+                <span className="absolute bottom-2 left-1 whitespace-nowrap text-[10px] leading-none tabular-nums text-neutral-400">{rulerLabel(f, fpsValue)}</span>
+              ) : null}
+            </div>
+          ))}
+        </div>
+        {/* Sections and scenes, from the render manifest. */}
+        <div className="absolute inset-x-0 overflow-hidden" style={{ top: RULER_H, height: BANDS_H }}>
           {(assets?.sections ?? []).filter((s) => visible(s.start, s.end)).map((s, i) => (
             <div
               key={s.id}
-              className={cn("absolute inset-y-0 border-l border-border", i % 2 ? "bg-foreground/[0.07]" : "bg-foreground/[0.03]")}
+              className={cn("absolute top-0 h-1/2 border-l border-white/20", i % 2 ? "bg-white/[0.10]" : "bg-white/[0.04]")}
               style={{ left: pct(s.start), width: `calc(${pct(s.end)} - ${pct(s.start)})` }}
               title={s.id}
             />
           ))}
-          {(assets?.sections ?? []).filter((s) => visible(s.start, s.end)).map((s) => (
-            // the label rides at the strip's left edge while its section starts off screen (zoomed in)
-            <span
-              key={`l-${s.id}`}
-              className="pointer-events-none absolute top-0 whitespace-nowrap px-1 leading-[14px] text-[10px]"
-              style={{ left: pct(Math.max(s.start, view.start)), maxWidth: `calc(${pct(s.end)} - ${pct(Math.max(s.start, view.start))})`, overflow: "hidden" }}
-            >
-              {s.id}
-            </span>
-          ))}
-        </div>
-        <div className="absolute inset-x-0 top-3.5 h-2.5 overflow-hidden">
           {(assets?.scenes ?? []).filter((s) => visible(s.start, s.end)).map((s, i) => (
             <div
               key={s.id}
-              className={cn("absolute inset-y-0 border-l border-foreground/30", i % 2 ? "bg-primary/25" : "bg-primary/10")}
+              className={cn("absolute bottom-0 h-1/2 border-l border-black/50", i % 2 ? "bg-sky-500/45" : "bg-sky-500/25")}
               style={{ left: pct(s.start), width: `calc(${pct(s.end)} - ${pct(s.start)})` }}
               title={`${s.id}${s.kind ? ` (${s.kind})` : ""}`}
             />
           ))}
-          {ticks.map((t) => (
-            <div key={t} className="absolute top-0 h-full w-px bg-foreground/25" style={{ left: pct(t) }} />
-          ))}
         </div>
-        {/* Filmstrip. */}
-        <div className="absolute inset-x-0 bottom-0 overflow-hidden bg-black/80" style={{ height: STRIP_H }}>
+        {/* Filmstrip with section labels, black frames marked red. */}
+        <div className="absolute inset-x-0 overflow-hidden rounded-sm bg-black" style={{ top: RULER_H + BANDS_H + 2, height: STRIP_H }}>
           {assets
             ? slots.map((slot, i) => (
-                <div key={i} className="absolute top-0 border-r border-black/60" style={{ left: slot.left, width: slot.width, height: STRIP_H, ...thumb(assets, slot.t, STRIP_H) }} />
+                <div key={i} className="absolute top-0 border-r border-black/70" style={{ left: slot.left, width: slot.width, height: STRIP_H, ...thumb(assets, slot.t, STRIP_H) }} />
               ))
             : null}
+          {(assets?.sections ?? []).filter((s) => visible(s.start, s.end)).map((s) => (
+            <span
+              key={`l-${s.id}`}
+              className="pointer-events-none absolute top-0 whitespace-nowrap rounded-br bg-black/60 px-1 text-[10px] leading-[14px] text-white"
+              style={{ left: pct(Math.max(s.start, view.start)) }}
+            >
+              {s.id}
+            </span>
+          ))}
           {(assets?.black ?? []).filter(([a, b]) => visible(a, b)).map(([a, b]) => (
             <div
               key={`${a}-${b}`}
@@ -289,10 +312,9 @@ export function Scrubber(props: Props) {
             />
           ))}
         </div>
-        {/* In and out, notes, hover and playhead. */}
         {props.inPoint !== null ? (
           <div
-            className="pointer-events-none absolute inset-y-0 bg-primary/20"
+            className="pointer-events-none absolute inset-y-0 bg-white/15"
             style={{
               left: pct(props.inPoint),
               width: props.outPoint !== null && props.outPoint >= props.inPoint ? `calc(${pct(props.outPoint)} - ${pct(props.inPoint)})` : "2px",
@@ -307,11 +329,8 @@ export function Scrubber(props: Props) {
               type="button"
               title={`#${note.seq} ${note.text}`}
               aria-label={`Note ${note.seq}`}
-              className={cn(
-                "absolute top-0 h-6 w-1.5 -translate-x-1/2 rounded-sm",
-                note.id === props.activeId ? "bg-primary" : "bg-foreground/70 hover:bg-foreground",
-              )}
-              style={{ left: pct(note.frameIn!) }}
+              className={cn("absolute h-3 w-2 -translate-x-1/2 rounded-sm", note.id === props.activeId ? "bg-amber-400" : "bg-amber-300/80 hover:bg-amber-300")}
+              style={{ left: pct(note.frameIn!), top: RULER_H - 4 }}
               onPointerDown={(event) => event.stopPropagation()}
               onClick={() => props.onSelectNote(note)}
             />
@@ -322,26 +341,19 @@ export function Scrubber(props: Props) {
             type="button"
             title={`#${note.seq} from ${note.versionLabel}: ${note.text}`}
             aria-label={`Note ${note.seq} from ${note.versionLabel}`}
-            className={cn(
-              "absolute top-1 h-4 w-1.5 -translate-x-1/2 rounded-sm border border-dashed",
-              note.id === props.activeId ? "border-primary bg-primary/40" : "border-foreground/60 bg-transparent hover:bg-foreground/40",
-            )}
-            style={{ left: pct(at) }}
+            className={cn("absolute h-3 w-2 -translate-x-1/2 rounded-sm border border-dashed", note.id === props.activeId ? "border-amber-400 bg-amber-400/40" : "border-amber-300/70 hover:bg-amber-300/40")}
+            style={{ left: pct(at), top: RULER_H - 4 }}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={() => props.onSelectNote(note)}
           />
         ))}
-        {hover ? <div className="pointer-events-none absolute inset-y-0 w-px bg-foreground/70" style={{ left: hover.x }} /> : null}
-        <div className="pointer-events-none absolute inset-y-0 w-0.5 bg-red-500" style={{ left: pct(frame) }} />
-        {/* Hover preview: the frame under the cursor with its timecode. */}
-        {hover && assets ? (
-          <div
-            className="pointer-events-none absolute bottom-[52px] z-10 -translate-x-1/2 rounded border border-border bg-popover p-1 shadow-md"
-            style={{ left: Math.max(70, Math.min(width - 70, hover.x)) }}
-          >
-            <div style={{ width: (72 * assets.w) / assets.h, height: 72, ...thumb(assets, (index.pts[hover.frame] ?? 0) - index.formatStart, 72) }} />
-          </div>
-        ) : null}
+        {/* With skimming off, a faint line shows where a click would put the playhead. */}
+        {!props.skimming && hoverX !== null ? <div className="pointer-events-none absolute inset-y-0 w-px bg-white/40" style={{ left: hoverX }} /> : null}
+        {/* The playhead: a white line with a head on the ruler. */}
+        <div className="pointer-events-none absolute inset-y-0 z-10" style={{ left: pct(frame) }}>
+          <div className="absolute -left-[5px] top-0 h-3 w-[11px] bg-white" style={{ clipPath: "polygon(0 0, 100% 0, 100% 60%, 50% 100%, 0 60%)" }} />
+          <div className="absolute inset-y-0 -left-px w-0.5 bg-white" />
+        </div>
       </div>
     </div>
   );

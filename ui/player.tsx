@@ -216,8 +216,11 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
   skimRef.current = skim;
   const proxyRef = useRef<HTMLVideoElement | null>(null);
 
-  // The skimmed frame on the proxy (a keyframe every 5 frames, so each seek lands at once); the full render stays on the playhead.
-  // One seek at a time: while the proxy is seeking, the newest skim frame waits and goes next (no backlog while the cursor flies).
+  // Scrubbing moves the playhead (CapCut): the playhead and the frame counter go to the cursor at once, the fast-seek proxy shows
+  // that frame while the cursor moves, and the full render seeks there once the cursor rests; the proxy steps aside when the full
+  // render shows the same frame. One proxy seek at a time: the newest target waits and goes next, so a fast sweep never queues.
+  const pendingRef = useRef<number | null>(null);
+  const settle = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skimTime = (n: number) => (index.pts[n] ?? 0) - index.formatStart + 0.5 / Math.max(1, index.fps.num / index.fps.den || 25);
   const applySkim = useCallback(() => {
     const proxy = proxyRef.current;
@@ -229,12 +232,48 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
   }, [index]);
   useEffect(() => applySkim(), [skim, applySkim]);
 
+  const scrubTo = useCallback(
+    (n: number) => {
+      const video = videoRef.current;
+      if (!video) return;
+      const target = Math.max(0, Math.min(last, Math.round(n)));
+      video.pause();
+      pendingRef.current = target;
+      if (props.scrub) setSkim(target);
+      onFrame(target);
+      if (settle.current) clearTimeout(settle.current);
+      settle.current = setTimeout(() => {
+        if (pendingRef.current !== target) return;
+        if (!video.seeking && frameAtTime(index, video.currentTime) === target) {
+          pendingRef.current = null;          // already there: no seek will report back
+          setSkim(null);
+          return;
+        }
+        video.currentTime = seekTimeForFrame(index, target);
+        // a seek that never reports (a stalled load) must not freeze the playhead
+        setTimeout(() => {
+          if (pendingRef.current === target) {
+            pendingRef.current = null;
+            setSkim(null);
+          }
+        }, 3000);
+      }, props.scrub ? 140 : 0);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [index, last, onFrame, props.scrub],
+  );
+  useEffect(() => () => {
+    if (settle.current) clearTimeout(settle.current);
+  }, []);
+
   const seek = useCallback(
     (n: number) => {
       const video = videoRef.current;
       if (!video) return;
       const target = Math.max(0, Math.min(last, Math.round(n)));
       video.pause();
+      pendingRef.current = target;
+      setSkim(null);
       video.currentTime = seekTimeForFrame(index, target);
       onFrame(target);
     },
@@ -282,9 +321,22 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
     const video = videoEl;
     if (!video || typeof video.requestVideoFrameCallback !== "function") return;
     let handle = 0;
+    // While a scrub or seek is on its way, the old frame must not pull the playhead back; the target arriving clears the proxy.
+    const arrive = (shown: number): boolean => {
+      const want = pendingRef.current;
+      if (want === null) return true;
+      if (shown !== want) return false;
+      pendingRef.current = null;
+      setSkim(null);
+      return true;
+    };
     const onPresented = (_now: number, metadata: VideoFrameCallbackMetadata) => {
       const shown = frameAtTime(index, metadata.mediaTime);
-      onFrame(shown);
+      if (!video.paused) {
+        pendingRef.current = null;
+        setSkim(null);
+      }
+      if (arrive(shown)) onFrame(shown);
       const { loop: looping, inPoint: a, outPoint: b } = loopRef.current;
       if (looping && a !== null && b !== null && !video.paused && shown >= b) {
         video.currentTime = seekTimeForFrame(index, a);
@@ -292,7 +344,10 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
       handle = video.requestVideoFrameCallback(onPresented);
     };
     handle = video.requestVideoFrameCallback(onPresented);
-    const onSeeked = () => onFrame(frameAtTime(index, video.currentTime));
+    const onSeeked = () => {
+      const shown = frameAtTime(index, video.currentTime);
+      if (arrive(shown)) onFrame(shown);
+    };
     video.addEventListener("seeked", onSeeked);
     return () => {
       video.cancelVideoFrameCallback(handle);
@@ -376,9 +431,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
             onSeeked={applySkim}
           />
         ) : null}
-        {skim !== null ? (
-          <span className="pointer-events-none absolute right-2 top-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] text-white">Skimming · frame {skim}</span>
-        ) : null}
+
         {compare && !side ? (
           <CompareVideo
             view={compare}
@@ -479,8 +532,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(props, ref
         assetsError={props.scrubError}
         skimming={props.skimming}
         onToggleSkim={props.onToggleSkim}
-        onSkim={setSkim}
-        onSeek={seek}
+        onScrub={scrubTo}
         notes={props.notes}
         mappedMarks={props.mappedMarks}
         activeId={props.activeId}
